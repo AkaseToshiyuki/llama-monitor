@@ -1901,7 +1901,7 @@ class TTUInterface:
 
             # CPU sparkline
             cpu_hist = list(self.cpu_usage_history)
-            spark = self._draw_mini_graph(cpu_hist, width=min(24, content_width - 4))
+            spark = self._draw_mini_graph(list(cpu_hist), width=min(24, content_width - 4))
             try:
                 self.stdscr.addstr(y, 2, f'  ▁▂▃▅▇ {spark}', CP(2) | C_DIM)
             except curses.error:
@@ -1929,7 +1929,7 @@ class TTUInterface:
 
             # GPU sparkline (aligned with CPU sparkline row)
             gpu_hist = list(getattr(self, 'gpu_usage_history', []))
-            gpu_spark = self._draw_mini_graph(gpu_hist, width=min(24, content_width - 4)) if gpu_hist else '─' * min(24, content_width - 4)
+            gpu_spark = self._draw_mini_graph(list(gpu_hist), width=min(24, content_width - 4)) if gpu_hist else '─' * min(24, content_width - 4)
             try:
                 self.stdscr.addstr(8, mid_x + 2, f'  ▁▂▃▅▇ {gpu_spark}', CP(20) | C_DIM)
             except curses.error:
