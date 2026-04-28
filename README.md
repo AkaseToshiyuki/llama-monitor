@@ -19,6 +19,9 @@
 - **多语言**: 中文/英语切换 (按 `M`)
 - **可调刷新率**: `+`/`-` 键调整刷新速度
 - **日志记录**: 自动轮转，最大 30MB
+- **状态图标**: ▶ ● ○ ✓ ✗ 等图标直观区分任务阶段
+- **脉冲动画**: 数据更新时当前值闪烁提示变化
+- **3区布局**: 面板标题带下划线，底部3区状态栏（Navigation | Status | Time）
 
 ### 安装
 
@@ -92,6 +95,9 @@ A Python-based real-time monitoring tool for LLAMA.cpp (llama-server) with beaut
 - **Multi-language**: Chinese/English toggle (press `M`)
 - **Adjustable Refresh**: `+`/`-` keys to change refresh speed
 - **Log Management**: Auto rotation, 30MB max
+- **Status Icons**: ▶ ● ○ ✓ ✗ for intuitive task stage recognition
+- **Pulse Animation**: Current values blink on data update
+- **3-Zone Layout**: Underlined panel titles, 3-zone footer (Navigation | Status | Time)
 
 ### Installation
 
