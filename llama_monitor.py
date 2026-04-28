@@ -367,8 +367,8 @@ class SystemCollector:
                                     self._cpu_usage = 100.0 * (1.0 - idle_delta / total_delta)
                             prev_idle = idle
                             prev_total = total
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"CPU read failed: {e}")
 
                 # Sample every 100ms for responsive but not CPU-intensive monitoring
                 self._cpu_stop_event.wait(0.1)
@@ -424,15 +424,15 @@ class SystemCollector:
                         if 'model name' in line:
                             cpu_info['model'] = line.split(':')[1].strip()
                             break
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"CPU model read failed: {e}")
         elif platform.system() == 'Darwin':  # macOS
             try:
                 result = os.popen('sysctl -n machdep.cpu.brand_string').read().strip()
                 if result:
                     cpu_info['model'] = result
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"CPU model read failed (macOS): {e}")
 
         # CPU usage - instant read from background thread (Linux /proc/stat)
         # On non-Linux or if thread failed, fall back to psutil
@@ -450,8 +450,8 @@ class SystemCollector:
             freq = psutil.cpu_freq()
             if freq and freq.current > 0:
                 cpu_info['frequency'] = freq.current  # MHz
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"CPU freq via psutil unavailable: {e}")
 
         # Method 2: /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq (Linux)
         if cpu_info['frequency'] <= 0 and platform.system() == 'Linux':
@@ -465,10 +465,10 @@ class SystemCollector:
                             if val > 0:
                                 cpu_info['frequency'] = val
                                 break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+                    except Exception as e:
+                        self.logger.debug(f"CPU freq sysfs read error: {e}")
+            except Exception as e:
+                self.logger.debug(f"CPU freq via sysfs unavailable: {e}")
 
         # Method 3: /proc/cpuinfo (Linux/macOS)
         if cpu_info['frequency'] <= 0:
@@ -482,10 +482,10 @@ class SystemCollector:
                                 try:
                                     cpu_info['frequency'] = float(val)
                                     break
-                                except ValueError:
-                                    continue
-            except Exception:
-                pass
+                                except ValueError as e:
+                                    self.logger.debug(f"CPU freq parse error: {e}")
+            except Exception as e:
+                self.logger.debug(f"CPU freq via cpuinfo unavailable: {e}")
 
         return cpu_info
 
@@ -506,8 +506,8 @@ class SystemCollector:
             mem_info['used'] = mem.used / (1024 ** 3)   # GB
             mem_info['available'] = mem.available / (1024 ** 3)  # GB
             mem_info['percent'] = mem.percent
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Memory info via psutil unavailable: {e}")
 
         # Try to get memory type and speed from dmidecode
         if platform.system() == 'Linux':
@@ -532,11 +532,11 @@ class SystemCollector:
                             if 'MT/s' in speed_str:
                                 try:
                                     mem_info['frequency'] = int(speed_str.split()[0])
-                                except ValueError:
-                                    pass
+                                except ValueError as e:
+                                    self.logger.debug(f"Memory speed parse error: {e}")
                             break  # Only take first memory stick info
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"Memory type/freq via dmidecode unavailable: {e}")
 
         return mem_info
 
@@ -579,43 +579,44 @@ class SystemCollector:
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     gpu_data['utilization'] = util.gpu
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU utilization unavailable: {e}")
 
                 try:
                     memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
                     gpu_data['memory_used'] = memory.used / (1024 ** 2)  # MB
                     gpu_data['memory_total'] = memory.total / (1024 ** 2)  # MB
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU memory info unavailable: {e}")
 
                 try:
                     gpu_data['temperature'] = pynvml.nvmlDeviceGetTemperature(
                         handle, pynvml.NVML_TEMPERATURE_GPU
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU temperature unavailable: {e}")
 
                 try:
                     gpu_data['gpu_clock'] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS) / 1000
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU clock info unavailable: {e}")
 
                 try:
                     gpu_data['mem_clock'] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM) / 1000
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU mem clock unavailable: {e}")
 
                 try:
                     gpu_data['fan_speed'] = pynvml.nvmlDeviceGetFanSpeed(handle)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU fan speed unavailable: {e}")
 
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle)
                     gpu_data['power'] = power / 1000  # Convert to Watts
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"GPU power usage unavailable: {e}")
+
 
                 gpu_info.append(gpu_data)
         except Exception as e:
@@ -651,16 +652,16 @@ class SystemCollector:
                         name = amdsmi.amdsmi_get_gpu_device_name(device)
                         if name:
                             gpu_data['name'] = name
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU name unavailable: {e}")
 
                     # Get utilization
                     try:
                         util = amdsmi.amdsmi_get_gpu_utilization(device)
                         if util:
                             gpu_data['utilization'] = util.get('gpu_utilization', 0)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU utilization unavailable: {e}")
 
                     # Get VRAM usage
                     try:
@@ -668,16 +669,17 @@ class SystemCollector:
                         if mem:
                             gpu_data['memory_used'] = mem.get('vram_used', 0) / (1024 ** 2)  # bytes to MB
                             gpu_data['memory_total'] = mem.get('vram_total', 0) / (1024 ** 2)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU memory info unavailable: {e}")
+
 
                     # Get temperature
                     try:
                         temp = amdsmi.amdsmi_get_gpu_temperature(device)
                         if temp:
                             gpu_data['temperature'] = temp.get('temperature', 0)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU temperature unavailable: {e}")
 
                     # Get clock frequencies
                     try:
@@ -685,24 +687,24 @@ class SystemCollector:
                         if clocks:
                             gpu_data['gpu_clock'] = clocks.get('sclk', 0) / 1000  # MHz to GHz
                             gpu_data['mem_clock'] = clocks.get('mclk', 0) / 1000
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU clock info unavailable: {e}")
 
                     # Get fan speed
                     try:
                         fan = amdsmi.amdsmi_get_gpu_fan_speed(device)
                         if fan:
                             gpu_data['fan_speed'] = fan.get('fan_speed', 0)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU fan speed unavailable: {e}")
 
                     # Get power consumption
                     try:
                         power = amdsmi.amdsmi_get_gpu_power(device)
                         if power:
                             gpu_data['power'] = power.get('power', 0) / 1000  # mW to W
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"AMD GPU power usage unavailable: {e}")
 
                     gpu_info.append(gpu_data)
 
@@ -722,8 +724,8 @@ class SystemCollector:
                     pynvml.nvmlShutdown()
                 elif self.gpu_type == 'amd':
                     amdsmi.amdsmi_shut_down()
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"GPU cleanup error: {e}")
 
         # Stop CPU monitoring thread
         if self._cpu_thread is not None:
@@ -765,8 +767,8 @@ class LLAMAServerClient:
         try:
             resp = self.session.get(self.base_url, timeout=self.timeout)
             return resp.status_code < 500
-        except Exception:
-            return False
+        except Exception as e:
+            self.logger.debug(f"Connection test failed: {e}")
     
     def probe_endpoints(self) -> Dict[str, Any]:
         """Probe common endpoints"""
@@ -1353,8 +1355,9 @@ class LLAMAServerClient:
                     prompt_eval_count = metrics.get('prompt_eval_count', 0)
                     eval_count = metrics.get('eval_count', 0)
                     running_requests = metrics.get('running_requests', 0)
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Fresh tasks metrics query failed: {e}")
+
 
         # Determine global stage: prefill if prompt being processed but no output yet
         global_stage = 'decode'
@@ -1543,6 +1546,20 @@ class TTUInterface:
         # Per-slot TPS tracking: {slot_id: (prev_n_decoded, prev_time)}
         self._slot_tps_tracker = {}
 
+        # Phase 2: Stage icons for status display
+        self.STAGE_ICONS = {
+            'prefill':  '▶',
+            'decode':   '●',
+            'waiting':  '○',
+            'queued':   '○',
+            'running':  '●',
+            'completed':'✓',
+            'failed':   '✗',
+        }
+
+        # Phase 2: Pulse animation flag
+        self._pulse_active = False
+
         # Initialize curses
         self._init_curses()
     
@@ -1596,8 +1613,8 @@ class TTUInterface:
                     curses.init_pair(self.COLOR_TPS_HIGH, curses.COLOR_GREEN, -1)   # >40 t/s - green
                     curses.init_pair(self.COLOR_TPS_MED, curses.COLOR_YELLOW, -1)    # 20-40 t/s - yellow
                     curses.init_pair(self.COLOR_TPS_LOW, curses.COLOR_RED, -1)      # <20 t/s - red
-                except curses.error:
-                    self._init_basic_colors()
+                except curses.error as e:
+                    self.logger.debug(f"Color init error: {e}")
             else:
                 self._init_basic_colors()
     
@@ -1621,9 +1638,16 @@ class TTUInterface:
             curses.init_pair(self.COLOR_TPS_HIGH, curses.COLOR_GREEN, -1)
             curses.init_pair(self.COLOR_TPS_MED, curses.COLOR_YELLOW, -1)
             curses.init_pair(self.COLOR_TPS_LOW, curses.COLOR_RED, -1)
-        except curses.error:
-            pass
-    
+            # Phase 2: Dim/bright color variants
+            curses.init_pair(18, curses.COLOR_GREEN, -1)    # Dim green
+            curses.init_pair(19, curses.COLOR_CYAN, -1)     # Dim cyan
+            curses.init_pair(20, curses.COLOR_MAGENTA, -1)  # Dim magenta
+            curses.init_pair(21, curses.COLOR_YELLOW, -1)    # Dim yellow
+            curses.init_pair(22, curses.COLOR_WHITE, -1)     # Bright white
+            curses.init_pair(23, curses.COLOR_RED, -1)       # Alert red
+        except curses.error as e:
+            self.logger.debug(f"Basic color init error: {e}")
+
     def _draw_bar(self, value: float, max_value: float, width: int = 20,
                   filled_color: int = 7, empty_color: int = 8):
         """Draw a progress bar using block characters"""
@@ -1635,6 +1659,39 @@ class TTUInterface:
 
         bar = '█' * filled + '░' * empty
         return bar
+
+    def _draw_shaded_bar_cell(self, row: int, bar_bottom: int, bar_top: int, base_color: int, x: int) -> None:
+        """Draw a single shaded bar cell based on vertical position.
+        Phase 2: Adds depth with sub-shading based on row position within bar range.
+        """
+        bar_range = bar_top - bar_bottom
+        shade_ratio = (row - bar_bottom) / bar_range if bar_range > 0 else 1.0
+        if shade_ratio > 0.66:
+            attr = curses.color_pair(base_color) | curses.A_BOLD
+        elif shade_ratio > 0.33:
+            attr = curses.color_pair(base_color)
+        else:
+            attr = curses.color_pair(base_color) | curses.A_DIM
+        try:
+            self.stdscr.addstr(row, x, "█", attr)
+        except curses.error:
+            pass
+
+    def _get_tps_color(self, tps: float) -> int:
+        """Get TPS color with sub-shading based on absolute value.
+        Phase 2: Extends TPS coloring to use dim/bright variants.
+        Returns a color pair index.
+        """
+        if tps >= 60:
+            return self.COLOR_TPS_HIGH  # Bright green (>60)
+        elif tps >= 40:
+            return 18  # Dim green (40-60)
+        elif tps >= 20:
+            return self.COLOR_TPS_MED  # Yellow (20-40)
+        elif tps >= 10:
+            return 21  # Dim yellow (10-20)
+        else:
+            return self.COLOR_TPS_LOW  # Red (<10)
 
     def _draw_sparkline(self, values: List[float], width: int = 20, height: int = 4,
                         min_val: float = None, max_val: float = None,
@@ -1840,8 +1897,8 @@ class TTUInterface:
             self.stdscr.addstr(y, center_x, title, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
             # Right align URL
             self.stdscr.addstr(y, x + width - len(url_str) - 1, url_str, curses.color_pair(self.COLOR_HEADER))
-        except curses.error:
-            pass
+        except curses.error as e:
+            self.logger.debug(f"Header draw error: {e}")
     
     def _draw_cpu_info(self, y: int, x: int, width: int, height: int):
         """Draw CPU information panel with proper graph and axis labels"""
@@ -1850,8 +1907,8 @@ class TTUInterface:
         if not self.cpu_info:
             try:
                 self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
-            except curses.error:
-                pass
+            except curses.error as e:
+                self.logger.debug(f"CPU panel not available draw error: {e}")
             return
 
         try:
@@ -1935,8 +1992,8 @@ class TTUInterface:
                 info_x += len(freq_str) + 2
             self.stdscr.addstr(info_y, info_x, cores_str, curses.color_pair(self.COLOR_CPU))
 
-        except curses.error:
-            pass
+        except curses.error as e:
+            self.logger.debug(f"CPU info draw error: {e}")
 
     def _draw_memory_info(self, y: int, x: int, width: int, height: int):
         """Draw Memory information panel with bar chart"""
@@ -1945,8 +2002,8 @@ class TTUInterface:
         if not self.memory_info or self.memory_info.get('total', 0) <= 0:
             try:
                 self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
-            except curses.error:
-                pass
+            except curses.error as e:
+                self.logger.debug(f"Memory panel not available draw error: {e}")
             return
 
         try:
@@ -2012,21 +2069,8 @@ class TTUInterface:
             if type_str:
                 self.stdscr.addstr(info_y, x + 2, type_str, curses.color_pair(self.COLOR_CPU))
 
-        except curses.error:
-            pass
-            mem_type = self.memory_info.get('type', 'Unknown')
-            mem_freq = self.memory_info.get('frequency', 0)
-            info_y = y + height - 2
-            if mem_type and mem_type != 'Unknown':
-                type_str = f"{mem_type}"
-                if mem_freq > 0:
-                    type_str += f" {mem_freq} MT/s"
-                self.stdscr.addstr(info_y, x + 2, type_str, curses.color_pair(self.COLOR_CPU))
-            elif mem_freq > 0:
-                self.stdscr.addstr(info_y, x + 2, f"{mem_freq} MT/s", curses.color_pair(self.COLOR_CPU))
-
-        except curses.error:
-            pass
+        except curses.error as e:
+            self.logger.debug(f"Memory info draw error: {e}")
 
     def _draw_gpu_info(self, y: int, x: int, width: int, height: int):
         """Draw GPU information panel with bar charts and stats"""
@@ -2035,8 +2079,9 @@ class TTUInterface:
         if not self.gpu_info:
             try:
                 self.stdscr.addstr(y + 2, x + 2, self.i18n.get('gpu_not_detected'), curses.color_pair(self.COLOR_WARNING))
-            except curses.error:
-                return
+            except curses.error as e:
+                self.logger.debug(f"GPU panel not detected draw error: {e}")
+            return
 
         # Calculate rows needed per GPU
         rows_per_gpu = 7  # 1 header + 2 GPU usage + 2 VRAM + 2 stats
@@ -2109,9 +2154,10 @@ class TTUInterface:
                 if stats and stats_y < y + height - 1:
                     self.stdscr.addstr(stats_y, x + 2, " | ".join(stats), curses.color_pair(temp_color))
 
-            except curses.error:
-                pass
-    
+
+            except curses.error as e:
+                self.logger.debug(f"GPU stats draw error: {e}")
+
     def _draw_model_status(self, y: int, x: int, width: int, height: int):
         """Draw model status panel - compact btop style"""
         self._draw_panel_header(y, x, width, height, self.i18n.get('model_status'), self.COLOR_MODEL)
@@ -2119,8 +2165,8 @@ class TTUInterface:
         if not self.model_info or len(self.model_info) == 0:
             try:
                 self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
-            except curses.error:
-                pass
+            except curses.error as e:
+                self.logger.debug(f"Model panel not available draw error: {e}")
             return
 
         try:
@@ -2134,16 +2180,17 @@ class TTUInterface:
             stage_row = y + 3
 
             if running_tasks:
-                # Show stage of first running task
+                # Show stage of first running task (with icon)
                 first_task = running_tasks[0]
                 stage = first_task.get('stage', 'unknown')
                 stage_translated = self.i18n.get(stage) if stage in ['prefill', 'decode', 'waiting'] else stage
                 stage_color = self.COLOR_PREFILL if stage == 'prefill' else (self.COLOR_DECODE if stage == 'decode' else self.COLOR_QUEUED)
-                self.stdscr.addstr(stage_row, x + 2, f"[{stage_translated.upper()}]", curses.color_pair(stage_color) | curses.A_BOLD)
+                icon = self.STAGE_ICONS.get(stage, '○')
+                self.stdscr.addstr(stage_row, x + 2, f"{icon} {stage_translated.upper()}", curses.color_pair(stage_color) | curses.A_BOLD)
             else:
                 state = self.model_info.get('state', 'Unknown')
                 stage_color = self.COLOR_SUCCESS if state == 'Running' else self.COLOR_WARNING
-                self.stdscr.addstr(stage_row, x + 2, f"[{state.upper()}]", curses.color_pair(stage_color) | curses.A_BOLD)
+                self.stdscr.addstr(stage_row, x + 2, f"● {state.upper()}", curses.color_pair(stage_color) | curses.A_BOLD)
 
             # Context - compact display
             ctx = self.model_info.get('context', 0)
@@ -2170,9 +2217,9 @@ class TTUInterface:
                 if eval_count > 0 or prompt_count > 0:
                     self.stdscr.addstr(y + height - 2, x + 2, f"In: {prompt_count:,} | Out: {eval_count:,}", curses.color_pair(self.COLOR_METRICS))
 
-        except curses.error:
-            pass
-    
+        except curses.error as e:
+            self.logger.debug(f"Model status draw error: {e}")
+
     def _draw_realtime_metrics(self, y: int, x: int, width: int, height: int):
         """Draw real-time metrics panel with bar chart and info at top"""
         self._draw_panel_header(y, x, width, height, self.i18n.get('realtime_metrics'), self.COLOR_METRICS)
@@ -2185,8 +2232,8 @@ class TTUInterface:
                 else:
                     msg = self.i18n.get('metrics_disabled')
                     self.stdscr.addstr(y + 2, x + 2, msg, curses.color_pair(self.COLOR_WARNING))
-            except curses.error:
-                pass
+            except curses.error as e:
+                self.logger.debug(f"Metrics panel not available draw error: {e}")
             return
 
         try:
@@ -2275,20 +2322,20 @@ class TTUInterface:
                         self.stdscr.addstr(time_y, bar_area_x + mid_pos, "15s", curses.color_pair(self.COLOR_METRICS))
                     self.stdscr.addstr(time_y, bar_area_x + bar_area_width - 3, "now", curses.color_pair(self.COLOR_METRICS))
 
-        except curses.error:
-            pass
-    
+        except curses.error as e:
+            self.logger.debug(f"Metrics time label draw error: {e}")
+
     def _draw_panel_header(self, y: int, x: int, width: int, height: int, title: str, color: int):
         """Draw a panel with header"""
         try:
             # Top border
             self.stdscr.addstr(y, x, '┌' + '─' * (width - 2) + '┐', curses.color_pair(color))
-            # Title
+            # Title with underline
             title_x = x + 2
-            self.stdscr.addstr(y, title_x, f" {title} ", curses.color_pair(color) | curses.A_BOLD)
-        except curses.error:
-            pass
-    
+            self.stdscr.addstr(y, title_x, f" {title} ", curses.color_pair(color) | curses.A_BOLD | curses.A_UNDERLINE)
+        except curses.error as e:
+            self.logger.debug(f"Panel header draw error: {e}")
+
     def _draw_tasks(self, y: int, x: int, width: int, height: int):
         """Draw tasks list with tree structure grouped by task_id (job_id)"""
         task_count = len(self.tasks)
@@ -2297,8 +2344,9 @@ class TTUInterface:
         if not self.tasks:
             try:
                 self.stdscr.addstr(y + 2, x + 2, self.i18n.get('no_tasks'), curses.color_pair(self.COLOR_QUEUED))
-            except curses.error:
-                return
+            except curses.error as e:
+                self.logger.debug(f"Tasks no_tasks draw error: {e}")
+            return
 
         # Determine header based on available data
         has_task_id = any(t.get('task_id', 0) for t in self.tasks)
@@ -2311,8 +2359,8 @@ class TTUInterface:
                 # Header for synthetic data (has In from metrics)
                 header = f"{'ID':<5} | {self.i18n.get('status'):<8} | {'In':<8} | {'Out':<8} | {'TPS':<8}"
             self.stdscr.addstr(y + 2, x + 2, header, curses.A_BOLD | curses.A_UNDERLINE)
-        except curses.error:
-            pass
+        except curses.error as e:
+            self.logger.debug(f"Tasks header draw error: {e}")
 
         # Group tasks by task_id (job_id)
         from collections import defaultdict
@@ -2344,8 +2392,8 @@ class TTUInterface:
                 full_line = f"{tree_char}{job_line:<21}"
                 try:
                     self.stdscr.addstr(row, x + 2, full_line[:width - 4], curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
-                except curses.error:
-                    pass
+                except curses.error as e:
+                    self.logger.debug(f"Tasks job line draw error: {e}")
                 row += 1
 
                 # Draw slots under this job
@@ -2376,8 +2424,8 @@ class TTUInterface:
                     slot_line = f"{slot_prefix}{slot_char}Slot {slot_id:<2} | {stage_str:<8} | {tokens_gen:<6} | {tps_str} | {progress:>3}%"
                     try:
                         self.stdscr.addstr(row, x + 2, slot_line[:width - 4], curses.color_pair(stage_color))
-                    except curses.error:
-                        pass
+                    except curses.error as e:
+                        self.logger.debug(f"Tasks slot line draw error: {e}")
                     row += 1
         else:
             # Synthetic data fallback (no tree structure)
@@ -2414,52 +2462,61 @@ class TTUInterface:
                 line = f"{task_id:<5} | {status_str:<8} | {prog_str}"
                 try:
                     self.stdscr.addstr(row, x + 2, line[:width - 4], curses.color_pair(status_color))
-                except curses.error:
-                    pass
+                except curses.error as e:
+                    self.logger.debug(f"Tasks synthetic draw error: {e}")
                 row += 1
-    
     def _draw_footer(self, y: int, x: int, width: int):
-        """Draw footer with shortcuts and status indicators"""
-        # Left side: shortcuts
+        """Draw footer with 3-zone layout: Navigation | Status | Time"""
+        # Phase 2: 3-zone footer layout
+        # Zone 1 (Navigation): shortcuts
+        # Zone 2 (Status): system status indicator
+        # Zone 3 (Time): refresh rate and timestamp
+
         shortcuts = [
-            f"[+/-]Rate",
-            f"[R]Refresh",
-            f"[L]Log",
-            f"[M]Lang",
-            f"[Q]Quit"
+            "[+/-]Rate",
+            "[R]Refresh",
+            "[L]Log",
+            "[M]Lang",
+            "[Q]Quit"
         ]
+        nav_str = " ".join(shortcuts)
 
-        sep = " | "
-        shortcut_str = sep.join(shortcuts)
+        # Zone 2: System status with icon
+        if self.api_consecutive_failures > 0:
+            status_str = f"⚠ API ERR {self.api_consecutive_failures}"
+            status_color = self.COLOR_ERROR
+        elif self.system_errors > 0:
+            status_str = f"⚠ SYS ERR {self.system_errors}"
+            status_color = self.COLOR_ERROR
+        else:
+            status_str = "● All Systems OK"
+            status_color = self.COLOR_SUCCESS
 
-        # Right side: refresh rate and last update
+        # Zone 3: Time info
         if self.last_update:
             time_str = self.last_update.strftime('%H:%M:%S')
             right_str = f"Rate: {self.refresh_interval*1000:.0f}ms | {time_str}"
         else:
             right_str = f"Rate: {self.refresh_interval*1000:.0f}ms"
 
-        # Add warning indicators
-        if self.api_consecutive_failures > 0:
-            right_str += f" | [API ERR: {self.api_consecutive_failures}]"
-        if self.system_errors > 0:
-            right_str += f" | [SYS ERR: {self.system_errors}]"
-
-        # Draw footer
+        # Draw footer border
         try:
             self.stdscr.addstr(y, x, '─' * width, curses.color_pair(self.COLOR_HEADER))
 
-            # Draw shortcuts on left
-            footer_color = self.COLOR_ERROR if self.api_consecutive_failures > 0 else self.COLOR_HEADER
-            self.stdscr.addstr(y + 1, x + 2, shortcut_str, curses.color_pair(footer_color))
+            # Zone 1: Navigation (left side)
+            self.stdscr.addstr(y + 1, x + 2, nav_str, curses.color_pair(self.COLOR_HEADER))
 
-            # Draw right info
+            # Zone 2: Status (center)
+            status_x = x + width // 2 - len(status_str) // 2
+            self.stdscr.addstr(y + 1, status_x, status_str, curses.color_pair(status_color))
+
+            # Zone 3: Time (right side)
             right_x = width - len(right_str) - 2
-            if right_x > len(shortcut_str) + 5:
-                self.stdscr.addstr(y + 1, right_x, right_str, curses.color_pair(footer_color))
-        except curses.error:
-            pass
-    
+            if right_x > x + len(nav_str) + 5:
+                self.stdscr.addstr(y + 1, right_x, right_str, curses.color_pair(self.COLOR_HEADER))
+        except curses.error as e:
+            self.logger.debug(f"Footer draw error: {e}")
+
     def refresh_system_data(self, cpu_collector: 'SystemCollector'):
         """Refresh system data (CPU, Memory, GPU) at fixed rate"""
         try:
@@ -2587,6 +2644,10 @@ class TTUInterface:
             self.last_successful_api = datetime.now()
             self.api_consecutive_failures = 0
 
+        # Phase 2: Trigger pulse animation on data refresh
+        self._pulse_active = True
+        threading.Timer(0.3, lambda: setattr(self, '_pulse_active', False)).start()
+
         self.last_update = datetime.now()
     
     def handle_input(self) -> bool:
@@ -2619,8 +2680,8 @@ class TTUInterface:
                 self.logger.debug(f"Detail mode: {self.detail_mode}")
             elif key in (ord('h'), ord('H'), ord('?')):
                 self.logger.info("Q=Quit, M=Lang, +/-=Rate, R=Refresh, L=Log")
-        except curses.error:
-            pass
+        except curses.error as e:
+            self.logger.debug(f"Input handling error: {e}")
 
         return True
     
@@ -2654,13 +2715,18 @@ class TTUInterface:
             tasks_height = total_height - upper_height - 1
 
             # Left column in upper area: CPU | Memory | Model (equal height, 3 parts)
-            panel_height = upper_height // 3
+            # Phase 2: Enforce minimum heights for readability
+            METRICS_MIN_HEIGHT = 8
+            GPU_MIN_HEIGHT = 12
+            raw_panel_height = upper_height // 3
+            panel_height = max(raw_panel_height, METRICS_MIN_HEIGHT)
             cpu_height = panel_height
             mem_height = panel_height
             model_height = panel_height
 
             # Right column in upper area: GPU (80%) | Metrics (20%)
-            gpu_height = int(upper_height * 0.80)
+            # Phase 2: Enforce minimum GPU height
+            gpu_height = max(int(upper_height * 0.80), GPU_MIN_HEIGHT)
             metrics_height = upper_height - gpu_height - 1
 
             # Draw upper left column
@@ -2893,8 +2959,8 @@ def main():
         try:
             cpu_collector.cleanup()
             server_client.close()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Cleanup error during shutdown: {e}")
         
         logger.info("LLAMA.cpp Monitor shutdown")
         logger.info("=" * 60)
