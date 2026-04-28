@@ -3134,6 +3134,10 @@ class TTUInterface:
             elif key in (ord('m'), ord('M')):
                 new_lang = self.i18n.toggle()
                 self.logger.info(f"Language switched to: {new_lang}")
+            elif key in (ord('u'), ord('U')):
+                self.ui_style = 'btop' if self.ui_style == 'default' else 'default'
+                self.logger.info(f"UI style switched to: {self.ui_style}")
+                self.stdscr.clear()  # Force full redraw after style switch
             elif key == ord('+') or key == ord('='):
                 # Increase refresh rate (decrease interval by 100ms, min 500ms)
                 self.refresh_interval = max(0.5, self.refresh_interval - 0.1)
@@ -3146,7 +3150,7 @@ class TTUInterface:
                 self.detail_mode = not self.detail_mode
                 self.logger.debug(f"Detail mode: {self.detail_mode}")
             elif key in (ord('h'), ord('H'), ord('?')):
-                self.logger.info("Q=Quit, M=Lang, +/-=Rate, R=Refresh, L=Log")
+                self.logger.info("Q=Quit, M=Lang, U=UI, +=RateUp, -=RateDown, R=Refresh, L=Log")
         except curses.error as e:
             self.logger.debug(f"Input handling error: {e}")
 
