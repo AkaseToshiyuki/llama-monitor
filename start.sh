@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 
 # Default values
 URL="http://localhost:8000"
-RATE="2"
+RATE="1"
 LANG="zh"
 LOG_DIR="$HOME/llama-monitor/logs"
 DEBUG=""
