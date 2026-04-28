@@ -23,16 +23,25 @@
 - **脉冲动画**: 数据更新时当前值闪烁提示变化
 - **3区布局**: 面板标题带下划线，底部3区状态栏（Navigation | Status | Time）
 
+### GPU 支持说明
+
+| GPU 类型 | 支持状态 | 依赖 |
+|---------|---------|------|
+| **NVIDIA** | ✅ 稳定 | `nvidia-ml-py` (pip install) |
+| **AMD** | ⚠️ 实验性 | `amdsmi` (pip install, experimental) |
+| **Apple Metal** | ⚠️ 实验性 | macOS + ctypes（无需额外依赖） |
+| **Intel** | ⚠️ 实验性 | Linux sysfs（无需额外依赖） |
+
+> **注意**: NVIDIA GPU 为稳定支持。AMD / Apple Metal / Intel GPU 为实验性支持，可能在不同环境下表现不一致。
+
 ### 安装
 
 ```bash
 pip install -r requirements.txt
-# GPU 监控 (NVIDIA 或 AMD ROCm)
-pip install nvidia-ml-py  # NVIDIA GPU
-# pip install amdsmi      # AMD GPU (experimental)
+# GPU 监控
+pip install nvidia-ml-py  # NVIDIA GPU (稳定)
+# pip install amdsmi      # AMD GPU (实验性)
 ```
-
-> **注意**: 支持 NVIDIA GPU (通过 pynvml) 和 AMD GPU (通过 amdsmi，实验性支持)。Apple Metal 暂不支持。
 
 ### 快速开始
 
@@ -75,8 +84,10 @@ python llama_monitor.py -l en -r 1
 - 检查 URL 和端口是否正确
 
 **GPU 监控不可用**
-- 确保安装了 `nvidia-ml-py`
-- 运行 `nvidia-smi` 验证 GPU
+- 确保已安装对应 GPU 的依赖包
+- NVIDIA: `pip install nvidia-ml-py` + `nvidia-smi`
+- AMD: `pip install amdsmi` (实验性)
+- Intel / Apple Metal: 无需额外依赖（自动检测）
 
 ---
 
@@ -99,16 +110,25 @@ A Python-based real-time monitoring tool for LLAMA.cpp (llama-server) with beaut
 - **Pulse Animation**: Current values blink on data update
 - **3-Zone Layout**: Underlined panel titles, 3-zone footer (Navigation | Status | Time)
 
+### GPU Support
+
+| GPU Type | Status | Dependencies |
+|----------|--------|--------------|
+| **NVIDIA** | ✅ Stable | `nvidia-ml-py` (pip install) |
+| **AMD** | ⚠️ Experimental | `amdsmi` (pip install, experimental) |
+| **Apple Metal** | ⚠️ Experimental | macOS + ctypes (no extra deps) |
+| **Intel** | ⚠️ Experimental | Linux sysfs (no extra deps) |
+
+> **Note**: NVIDIA GPU is stable. AMD / Apple Metal / Intel GPU are experimental and may behave inconsistently across environments.
+
 ### Installation
 
 ```bash
 pip install -r requirements.txt
-# GPU monitoring (NVIDIA or AMD ROCm)
-pip install nvidia-ml-py  # NVIDIA GPU
+# GPU monitoring
+pip install nvidia-ml-py  # NVIDIA GPU (stable)
 # pip install amdsmi      # AMD GPU (experimental)
 ```
-
-> **Note**: Supports NVIDIA GPU (via pynvml) and AMD GPU (via amdsmi, experimental). Apple Metal is not yet supported.
 
 ### Quick Start
 
@@ -151,8 +171,10 @@ python llama_monitor.py -l en -r 1
 - Check URL and port are correct
 
 **GPU monitoring not available**
-- Ensure `nvidia-ml-py` is installed
-- Run `nvidia-smi` to verify GPU
+- Ensure the appropriate GPU package is installed
+- NVIDIA: `pip install nvidia-ml-py` + `nvidia-smi`
+- AMD: `pip install amdsmi` (experimental)
+- Intel / Apple Metal: No extra deps needed (auto-detected)
 
 ### Server Requirements
 

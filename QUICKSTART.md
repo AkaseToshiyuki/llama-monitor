@@ -29,6 +29,15 @@ python3 llama_monitor.py -D
 python3 llama_monitor.py -d /var/log/llama-monitor
 ```
 
+## GPU 支持状态
+
+| GPU 类型 | 状态 | 依赖 | 备注 |
+|---------|------|------|------|
+| NVIDIA | ✅ 稳定 | `nvidia-ml-py` | 完整支持所有指标 |
+| AMD | ⚠️ 实验性 | `amdsmi` | ROCm 环境 |
+| Apple Metal | ⚠️ 实验性 | 无需额外依赖 | macOS 系统 |
+| Intel | ⚠️ 实验性 | 无需额外依赖 | Linux sysfs |
+
 ## 快捷键
 
 | 按键 | 功能 |
@@ -98,7 +107,8 @@ Q=退出 R=刷新 +=加速    |  ● All Systems OK   |  14:23:30
 **GPU 信息不显示？**
 - 确保安装 GPU 驱动 (NVIDIA 或 AMD ROCm)
 - NVIDIA: `pip install nvidia-ml-py` + `nvidia-smi`
-- AMD: `pip install amdsmi` + `rocm-smi`
+- AMD: `pip install amdsmi` + rocm-smi
+- Intel / Apple Metal: 无需额外依赖（自动检测）
 
 **界面显示异常？**
 - 确保终端支持 256 色
@@ -118,7 +128,7 @@ Q=退出 R=刷新 +=加速    |  ● All Systems OK   |  14:23:30
 psutil>=5.9.0
 requests>=2.28.0
 
-# 可选依赖（GPU 监控）
-nvidia-ml-py>=11.0  # NVIDIA GPU
-amdsmi              # AMD GPU (experimental)
+# GPU 依赖
+nvidia-ml-py>=11.0  # NVIDIA GPU (稳定)
+# amdsmi              # AMD GPU (实验性, pip install)
 ```
