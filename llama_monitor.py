@@ -51,7 +51,8 @@ except ImportError:
     amdsmi = None  # type: ignore
 
 # GPU support flag (NVIDIA, AMD, Apple Metal, or Intel)
-GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE or INTEL_AVAILABLE
+# Defined after all individual GPU availability flags are set
+GPU_SUPPORTED = False
 
 # Apple Metal GPU support (macOS only)
 METAL_AVAILABLE = False
@@ -72,6 +73,9 @@ if platform.system() == 'Linux':
             INTEL_AVAILABLE = True
     except Exception:
         pass
+
+# Final GPU support flag
+GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE or INTEL_AVAILABLE
 
 # ============================================================================
 # Internationalization (i18n)
