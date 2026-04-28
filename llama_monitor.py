@@ -49,8 +49,18 @@ except ImportError:
     AMDSMI_AVAILABLE = False
     amdsmi = None  # type: ignore
 
-# GPU support flag (NVIDIA or AMD)
-GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE
+# GPU support flag (NVIDIA, AMD or Apple Metal)
+GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE
+
+# Apple Metal GPU support (macOS only)
+METAL_AVAILABLE = False
+if platform.system() == 'Darwin':
+    try:
+        import ctypes
+        # Basic Metal support check - C bindings exist on macOS
+        METAL_AVAILABLE = True
+    except ImportError:
+        METAL_AVAILABLE = False
 
 # ============================================================================
 # Internationalization (i18n)
@@ -402,9 +412,19 @@ class SystemCollector:
                 except Exception as e:
                     self.logger.debug(f"AMD GPU init failed: {e}")
 
+            # Try Apple Metal if NVIDIA and AMD both failed
+            if not self.gpu_initialized and METAL_AVAILABLE and platform.system() == 'Darwin':
+                try:
+                    self.gpu_count = 1
+                    self.gpu_initialized = True
+                    self.gpu_type = 'apple'
+                    self.logger.info("GPU monitoring initialized (Apple Metal)")
+                except Exception as e:
+                    self.logger.debug(f"Apple Metal GPU init failed: {e}")
+
             if not self.gpu_initialized:
                 self.gpu_available = False
-                self.logger.warning("GPU monitoring unavailable (no NVIDIA or AMD GPU detected)")
+                self.logger.warning("GPU monitoring unavailable (no NVIDIA, AMD or Apple GPU detected)")
     
     def get_cpu_info(self) -> Dict[str, Any]:
         """Get CPU information"""
@@ -551,6 +571,8 @@ class SystemCollector:
             return self._get_nvidia_gpu_info()
         elif self.gpu_type == 'amd':
             return self._get_amd_gpu_info()
+        elif self.gpu_type == 'apple':
+            return self._get_apple_gpu_info()
 
         return gpu_info
 
@@ -715,7 +737,76 @@ class SystemCollector:
             self.logger.warning(f"AMD GPU info collection failed: {e}")
 
         return gpu_info
-    
+
+    def _get_apple_gpu_info(self) -> List[Dict[str, Any]]:
+        """Get Apple GPU information via system_profiler and powermetrics"""
+        gpu_info = []
+        gpu_data = {
+            'index': 0,
+            'name': 'Apple GPU',
+            'type': 'Apple',
+            'utilization': 0,
+            'memory_used': 0,
+            'memory_total': 0,
+            'temperature': 0,
+            'gpu_clock': 0,
+            'mem_clock': 0,
+            'fan_speed': 0,
+            'power': 0
+        }
+
+        # Get GPU name from system_profiler
+        try:
+            result = subprocess.run(
+                ['system_profiler', 'SPDisplaysDataType', '-json'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                import json
+                data = json.loads(result.stdout)
+                if 'SPDisplaysDataType' in data and len(data['SPDisplaysDataType']) > 0:
+                    display = data['SPDisplaysDataType'][0]
+                    gpu_data['name'] = display.get('sppci_model', 'Apple GPU')
+        except Exception as e:
+            self.logger.debug(f"Apple GPU name unavailable: {e}")
+
+        # Get GPU utilization from powermetrics (requires sudo, fallback gracefully)
+        try:
+            result = subprocess.run(
+                ['sudo', 'powermetrics', '--samplers', 'gpu', '-i', '1000', '-n', '1'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                output = result.stdout
+                # Parse gpu_active (activity percentage)
+                for line in output.split('\n'):
+                    if 'gpu_active' in line.lower():
+                        try:
+                            val = float(''.join(filter(lambda x: x.isdigit() or x == '.', line.split('gpu_active')[-1])))
+                            gpu_data['utilization'] = min(val, 100)
+                        except:
+                            pass
+        except Exception as e:
+            self.logger.debug(f"Apple GPU utilization unavailable: {e}")
+
+        # Get memory info from memory_pressure if available
+        try:
+            result = subprocess.run(
+                ['sysctl', '-n', 'hw.memsize'],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                total_mem = int(result.stdout.strip())
+                gpu_data['memory_total'] = total_mem / (1024 ** 2)  # MB
+                # Apple shares system memory, approximate VRAM as 1/4 of system RAM for dGPU
+                if 'Apple' not in gpu_data['name'] and 'M' in gpu_data['name']:
+                    gpu_data['memory_total'] = min(gpu_data['memory_total'], 16384)
+        except Exception as e:
+            self.logger.debug(f"Apple GPU memory info unavailable: {e}")
+
+        gpu_info.append(gpu_data)
+        return gpu_info
+
     def cleanup(self):
         """Cleanup GPU resources"""
         if self.gpu_initialized:
