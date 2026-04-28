@@ -16,6 +16,7 @@ import logging
 import os
 import platform
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,8 +50,8 @@ except ImportError:
     AMDSMI_AVAILABLE = False
     amdsmi = None  # type: ignore
 
-# GPU support flag (NVIDIA, AMD or Apple Metal)
-GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE
+# GPU support flag (NVIDIA, AMD, Apple Metal, or Intel)
+GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE or INTEL_AVAILABLE
 
 # Apple Metal GPU support (macOS only)
 METAL_AVAILABLE = False
@@ -61,6 +62,16 @@ if platform.system() == 'Darwin':
         METAL_AVAILABLE = True
     except ImportError:
         METAL_AVAILABLE = False
+
+# Intel GPU support (Linux only, via sysfs)
+INTEL_AVAILABLE = False
+if platform.system() == 'Linux':
+    try:
+        result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+        if 'Intel' in result.stdout and 'VGA' in result.stdout:
+            INTEL_AVAILABLE = True
+    except Exception:
+        pass
 
 # ============================================================================
 # Internationalization (i18n)
@@ -333,7 +344,7 @@ class SystemCollector:
         self.gpu_available = GPU_SUPPORTED
         self.gpu_initialized = False
         self.gpu_count = 0
-        self.gpu_type = None  # 'nvidia' or 'amd'
+        self.gpu_type = None  # 'nvidia', 'amd', 'apple', or 'intel'
         self.logger = logging.getLogger('llama_monitor')
 
         # CPU usage tracking for instant reading
@@ -422,9 +433,19 @@ class SystemCollector:
                 except Exception as e:
                     self.logger.debug(f"Apple Metal GPU init failed: {e}")
 
+            # Try Intel GPU if NVIDIA, AMD, Apple Metal all failed
+            if not self.gpu_initialized and INTEL_AVAILABLE and platform.system() == 'Linux':
+                try:
+                    self.gpu_initialized = True
+                    self.gpu_type = 'intel'
+                    self.gpu_count = 1
+                    self.logger.info("GPU monitoring initialized (Intel)")
+                except Exception as e:
+                    self.logger.debug(f"Intel GPU init failed: {e}")
+
             if not self.gpu_initialized:
                 self.gpu_available = False
-                self.logger.warning("GPU monitoring unavailable (no NVIDIA, AMD or Apple GPU detected)")
+                self.logger.warning("GPU monitoring unavailable (no NVIDIA, AMD, Apple or Intel GPU detected)")
     
     def get_cpu_info(self) -> Dict[str, Any]:
         """Get CPU information"""
@@ -573,6 +594,8 @@ class SystemCollector:
             return self._get_amd_gpu_info()
         elif self.gpu_type == 'apple':
             return self._get_apple_gpu_info()
+        elif self.gpu_type == 'intel':
+            return self._get_intel_gpu_info()
 
         return gpu_info
 
@@ -736,6 +759,90 @@ class SystemCollector:
         except Exception as e:
             self.logger.warning(f"AMD GPU info collection failed: {e}")
 
+        return gpu_info
+
+    def _get_intel_gpu_info(self) -> List[Dict[str, Any]]:
+        """Get Intel GPU information via sysfs and lspci"""
+        gpu_info = []
+        gpu_data = {
+            'index': 0,
+            'name': 'Intel GPU',
+            'type': 'Intel',
+            'utilization': 0,
+            'memory_used': 0,
+            'memory_total': 0,
+            'temperature': 0,
+            'gpu_clock': 0,
+            'mem_clock': 0,
+            'fan_speed': 0,
+            'power': 0
+        }
+
+        # Get GPU name from lspci
+        try:
+            result = subprocess.run(
+                ['lspci', '-mm', '-n'],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.split('\n'):
+                if '0300' in line and 'Intel' in line:
+                    name_result = subprocess.run(
+                        ['lspci', '-mm', '-n', '-nn'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    for nline in name_result.stdout.split('\n'):
+                        if 'VGA' in nline and 'Intel' in nline:
+                            try:
+                                gpu_data['name'] = nline.split('"')[1] if '"' in nline else 'Intel GPU'
+                            except Exception:
+                                pass
+                    break
+        except Exception as e:
+            self.logger.debug(f"Intel GPU name unavailable: {e}")
+
+        # Read utilization from sysfs
+        try:
+            for card in ['card0', 'card1', 'card2']:
+                busy_path = f'/sys/class/drm/{card}/device/gpu_busy_percent'
+                if os.path.exists(busy_path):
+                    with open(busy_path, 'r') as f:
+                        gpu_data['utilization'] = float(f.read().strip())
+                    break
+        except Exception as e:
+            self.logger.debug(f"Intel GPU utilization unavailable: {e}")
+
+        # Read memory info from sysfs
+        try:
+            for card in ['card0', 'card1', 'card2']:
+                mem_path = f'/sys/class/drm/{card}/device/mem_info_vram_total'
+                if os.path.exists(mem_path):
+                    with open(mem_path, 'r') as f:
+                        gpu_data['memory_total'] = int(f.read().strip()) / (1024 * 1024)  # bytes to MB
+                    used_path = f'/sys/class/drm/{card}/device/mem_info_vram_used'
+                    if os.path.exists(used_path):
+                        with open(used_path, 'r') as f:
+                            gpu_data['memory_used'] = int(f.read().strip()) / (1024 * 1024)
+                    break
+        except Exception as e:
+            self.logger.debug(f"Intel GPU memory info unavailable: {e}")
+
+        # Read GPU clock from sysfs
+        try:
+            for card in ['card0', 'card1', 'card2']:
+                paths = [
+                    f'/sys/class/drm/{card}/device/gt_cur_freq_mhz',
+                    f'/sys/class/drm/{card}/device/gt_max_freq_mhz',
+                ]
+                for fp in paths:
+                    if os.path.exists(fp):
+                        with open(fp, 'r') as f:
+                            mhz = int(f.read().strip())
+                            gpu_data['gpu_clock'] = mhz / 1000  # MHz to GHz
+                        break
+        except Exception as e:
+            self.logger.debug(f"Intel GPU clock unavailable: {e}")
+
+        gpu_info.append(gpu_data)
         return gpu_info
 
     def _get_apple_gpu_info(self) -> List[Dict[str, Any]]:
