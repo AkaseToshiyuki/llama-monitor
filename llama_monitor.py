@@ -344,7 +344,7 @@ class SystemCollector:
         self.gpu_available = GPU_SUPPORTED
         self.gpu_initialized = False
         self.gpu_count = 0
-        self.gpu_type = None  # 'nvidia', 'amd', 'apple', or 'intel'
+        self.gpu_type = None  # 'nvidia' (stable) | 'amd', 'apple', 'intel' (experimental)
         self.logger = logging.getLogger('llama_monitor')
 
         # CPU usage tracking for instant reading
@@ -419,7 +419,7 @@ class SystemCollector:
                         self.gpu_count = len(devices)
                         self.gpu_initialized = True
                         self.gpu_type = 'amd'
-                        self.logger.info(f"GPU monitoring initialized (AMD): {self.gpu_count} device(s)")
+                        self.logger.warning(f"GPU monitoring initialized (AMD, experimental): {self.gpu_count} device(s)")
                 except Exception as e:
                     self.logger.debug(f"AMD GPU init failed: {e}")
 
@@ -429,7 +429,7 @@ class SystemCollector:
                     self.gpu_count = 1
                     self.gpu_initialized = True
                     self.gpu_type = 'apple'
-                    self.logger.info("GPU monitoring initialized (Apple Metal)")
+                    self.logger.warning("GPU monitoring initialized (Apple Metal, experimental)")
                 except Exception as e:
                     self.logger.debug(f"Apple Metal GPU init failed: {e}")
 
@@ -439,13 +439,13 @@ class SystemCollector:
                     self.gpu_initialized = True
                     self.gpu_type = 'intel'
                     self.gpu_count = 1
-                    self.logger.info("GPU monitoring initialized (Intel)")
+                    self.logger.warning("GPU monitoring initialized (Intel, experimental)")
                 except Exception as e:
                     self.logger.debug(f"Intel GPU init failed: {e}")
 
             if not self.gpu_initialized:
                 self.gpu_available = False
-                self.logger.warning("GPU monitoring unavailable (no NVIDIA, AMD, Apple or Intel GPU detected)")
+                self.logger.warning("GPU monitoring unavailable (no NVIDIA GPU detected; AMD/Apple/Intel are experimental)")
     
     def get_cpu_info(self) -> Dict[str, Any]:
         """Get CPU information"""
