@@ -1792,179 +1792,201 @@ class TTUInterface:
         return bars
 
     def _draw_btop_ui(self):
-        """Draw btop-style TUI layout.
-        More compact, higher information density with mini graphs.
+        """Draw btop-style TUI layout - Floating Modular Dashboard.
+
+        Each module floats in its own space with visual air between sections.
+        No box-drawing chars - uses colored headers and whitespace for separation.
         """
         try:
             height, width = self.stdscr.getmaxyx()
             self.stdscr.erase()
 
-            # Color pairs for btop mode
             CP = curses.color_pair
-            C_GREEN = CP(2)   # CPU
-            C_CYAN = CP(19)   # Mem
-            C_MAGENTA = CP(20) # GPU
-            C_YELLOW = CP(21)  # Metrics
-            C_WHITE = CP(1)    # Default
+            C_DIM = curses.A_DIM
+            C_BOLD = curses.A_BOLD
 
-            def color_for(percent: float) -> int:
-                """Get color based on usage percentage."""
+            # Color palette - soft, readable colors with good contrast
+            C_TITLE = CP(1) | C_BOLD
+            C_HEADER_CPU = CP(2) | C_BOLD     # Green header
+            C_HEADER_GPU = CP(20) | C_BOLD    # Magenta header
+            C_HEADER_MEM = CP(19) | C_BOLD    # Cyan header
+            C_HEADER_PERF = CP(21) | C_BOLD   # Yellow header
+            C_HEADER_TASK = CP(13) | C_BOLD   # Yellow header
+            C_LABEL = CP(1) | C_DIM           # Dim white for labels
+            C_VALUE = CP(1)                   # Plain white for values
+
+            def color_for(percent: float):
+                """Get color based on usage percentage - soft ramp."""
                 if percent < 60:
-                    return 2  # Green
+                    return CP(2)   # Green
                 elif percent < 85:
-                    return 13  # Yellow
+                    return CP(11)  # Yellow (brighter)
                 else:
-                    return 14  # Red
+                    return CP(9)   # Red (brighter)
 
-            # ── Title bar ─────────────────────────────────────────────
+            def mod_header(label: str, y: int, x: int, color) -> int:
+                """Draw a floating module header. Returns next y position."""
+                header = f'  ██ {label} ██  '
+                try:
+                    self.stdscr.addstr(y, x, header, color)
+                except curses.error:
+                    pass
+                return y + 1
+
+            def bar_row(label: str, value_str: str, pct: float,
+                        y: int, x: int, bar_width: int = 12) -> int:
+                """Draw a labeled bar row. Returns next y."""
+                try:
+                    self.stdscr.addstr(y, x, f'  {label}', C_LABEL)
+                except curses.error:
+                    pass
+                filled = min(int(pct / 100 * bar_width), bar_width)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                bar_color = color_for(pct)
+                try:
+                    self.stdscr.addstr(y, x + 10, f'{bar} ', bar_color)
+                    self.stdscr.addstr(y, x + 10 + bar_width + 1, value_str, C_VALUE)
+                except curses.error:
+                    pass
+                return y + 1
+
+            def kv_row(label: str, value_str: str, y: int, x: int) -> int:
+                """Draw a label: value row. Returns next y."""
+                try:
+                    self.stdscr.addstr(y, x, f'  {label:<8}', C_LABEL)
+                    self.stdscr.addstr(y, x + 10, value_str, C_VALUE)
+                except curses.error:
+                    pass
+                return y + 1
+
+            # ════════════════════════════════════════════════════════════
+            # TITLE BAR
+            # ════════════════════════════════════════════════════════════
             hostname = socket.gethostname()
             uptime_seconds = time.time() - psutil.boot_time()
             uptime_str = self._format_uptime(uptime_seconds)
-            model_name = (self.model_info.get('name', '') if self.model_info else '')[:30]
-            title = f'┌─ {self.i18n.get("title")} ──'
-            title += f' uptime: {uptime_str} ─'
+            model_name = (self.model_info.get('name', '') if self.model_info else '')[:35]
+            title = f'  ● {self.i18n.get("title")}  │  uptime: {uptime_str}'
             if model_name:
-                title += f' ─ Model: {model_name} ─'
-            title += ' ' * max(0, width - len(title) - 1) + '┐'
+                title += f'  │  {model_name}'
             try:
-                self.stdscr.addstr(0, 0, title[:width-1], CP(1) | curses.A_BOLD)
+                self.stdscr.addstr(0, 0, title[:width-1], C_TITLE)
+                ts = self.last_update.strftime('%H:%M:%S') if self.last_update else '--:--:--'
+                self.stdscr.addstr(0, max(0, width - len(ts) - 2), f'  {ts}', C_DIM)
             except curses.error:
                 pass
 
-            # ── Row 1: CPU + Model │ GPU + Temp ──────────────────────
-            # Layout: [CPU info] │ [GPU info]
-            # Split width: left ~45%, right ~55%
-            mid_x = max(1, width // 2 - 5)
-            right_x = mid_x + 1
+            # ════════════════════════════════════════════════════════════
+            # LAYOUT: Two-column grid with floating modules
+            # Left col: CPU, MEM  |  Right col: GPU, PERF
+            # Bottom: TASKS (full width)
+            # ════════════════════════════════════════════════════════════
+            mid_x = max(2, width // 2 - 1)
+            content_width = mid_x - 2
 
-            row1_y = 1
+            y = 2
 
-            # CPU section (left)
-            cpu = self.cpu_info
-            cpu_usage = cpu.get('usage', 0) if cpu else 0
-            cpu_freq = cpu.get('frequency', 0) / 1000 if cpu else 0
-            cpu_cores = cpu.get('cores', 0) if cpu else 0
-            cpu_threads = cpu.get('threads', 0) if cpu else 0
+            # ── ROW 1: CPU + GPU (side by side) ────────────────────────
+            y = mod_header('CPU', y, 0, C_HEADER_CPU)
+            cpu = self.cpu_info or {}
+            cpu_usage = cpu.get('usage', 0)
+            cpu_freq = cpu.get('frequency', 0) / 1000
+            cpu_cores = cpu.get('cores', 0)
+            cpu_threads = cpu.get('threads', 0)
 
-            # Mini CPU graph (last 30 values)
-            cpu_graph = self._draw_mini_graph(list(self.cpu_usage_history), width=20)
+            y = bar_row('Usage', f'{cpu_usage:5.1f}%', cpu_usage, y, 0)
+            freq_str = f'{cpu_freq:.2f}GHz' if cpu_freq > 0 else 'N/A'
+            y = kv_row('Freq', freq_str, y, 0)
+            y = kv_row('Cores', f'{cpu_cores}c/{cpu_threads}t', y, 0)
 
-            cpu_bar_width = 10
-            cpu_bar_filled = int(cpu_usage / 100 * cpu_bar_width)
-            cpu_bar = '█' * cpu_bar_filled + '░' * (cpu_bar_width - cpu_bar_filled)
-
-            cpu_line1 = f'│ CPU: {cpu_usage:4.1f}% {cpu_bar}'
-            freq_str = f'{cpu_freq:.2f}GHz' if cpu_freq > 0 else ''
-            cores_str = f'{cpu_cores}/{cpu_threads}c'
-            cpu_line1 += f' {freq_str} {cores_str}' if freq_str else f' {cores_str}'
-
-            # Pad to mid_x
-            cpu_line1 = cpu_line1.ljust(mid_x - 1) + '│'
+            # CPU sparkline
+            cpu_hist = list(self.cpu_usage_history)
+            spark = self._draw_mini_graph(cpu_hist, width=min(24, content_width - 4))
             try:
-                self.stdscr.addstr(row1_y, 0, cpu_line1[:width-1], color_for(cpu_usage))
+                self.stdscr.addstr(y, 2, f'  ▁▂▃▅▇ {spark}', CP(2) | C_DIM)
             except curses.error:
                 pass
+            y += 1
 
-            # GPU section (right)
+            y += 1  # Gap between modules
+
+            # GPU module (right column, aligned with CPU)
+            gpu_y = 3
             gpu = self.gpu_info[0] if self.gpu_info else {}
-            gpu_usage = gpu.get('utilization', 0) if gpu else 0
-            gpu_mem_used = gpu.get('memory_used', 0) / 1024 if gpu else 0
-            gpu_mem_total = gpu.get('memory_total', 0) / 1024 if gpu else 0
-            gpu_temp = gpu.get('temperature', 0) if gpu else 0
-            gpu_power = gpu.get('power', 0) if gpu else 0
+            gpu_usage = gpu.get('utilization', 0)
+            gpu_mem_used = gpu.get('memory_used', 0) / 1024
+            gpu_mem_total = gpu.get('memory_total', 0) / 1024
+            gpu_temp = gpu.get('temperature', 0)
+            gpu_power = gpu.get('power', 0)
 
-            gpu_mem_pct = (gpu_mem_used / gpu_mem_total * 100) if gpu_mem_total > 0 else 0
-
-            gpu_bar_width = 10
-            gpu_bar_filled = int(gpu_usage / 100 * gpu_bar_width)
-            gpu_bar = '█' * gpu_bar_filled + '░' * (gpu_bar_width - gpu_bar_filled)
-
-            gpu_line1 = f' GPU: {gpu_usage:4.1f}% {gpu_bar}'
-            gpu_line1 += f' {gpu_mem_used:.0f}/{gpu_mem_total:.0f}GB'
+            gpu_y = mod_header('GPU', gpu_y, mid_x, C_HEADER_GPU)
+            gpu_y = bar_row('Usage', f'{gpu_usage:5.1f}%', gpu_usage, gpu_y, mid_x)
+            gpu_y = kv_row('Mem', f'{gpu_mem_used:.1f}/{gpu_mem_total:.1f}GB', gpu_y, mid_x)
             if gpu_temp > 0:
-                gpu_line1 += f' {gpu_temp}°C'
+                gpu_y = kv_row('Temp', f'{gpu_temp}°C', gpu_y, mid_x)
             if gpu_power > 0:
-                gpu_line1 += f' {gpu_power:.0f}W'
-            gpu_line1 = gpu_line1.ljust(width - 1) + '│'
+                gpu_y = kv_row('Power', f'{gpu_power:.0f}W', gpu_y, mid_x)
+
+            # GPU sparkline (aligned with CPU sparkline row)
+            gpu_hist = list(getattr(self, 'gpu_usage_history', []))
+            gpu_spark = self._draw_mini_graph(gpu_hist, width=min(24, content_width - 4)) if gpu_hist else '─' * min(24, content_width - 4)
             try:
-                gpu_color = C_MAGENTA if gpu_usage < 80 else (C_YELLOW if gpu_usage < 95 else CP(14))
-                self.stdscr.addstr(row1_y, right_x, gpu_line1[:width-right_x-1], gpu_color)
+                self.stdscr.addstr(8, mid_x + 2, f'  ▁▂▃▅▇ {gpu_spark}', CP(20) | C_DIM)
             except curses.error:
                 pass
 
-            # ── Row 2: Memory │ CPU Graph ──────────────────────────────
-            row2_y = 2
-            mem = self.memory_info
-            mem_usage = mem.get('percent', 0) if mem else 0
-            mem_used = mem.get('used', 0) if mem else 0
-            mem_total = mem.get('total', 0) if mem else 0
+            y += 2  # Gap before next row
 
-            mem_bar_width = 15
-            mem_bar_filled = int(mem_usage / 100 * mem_bar_width)
-            mem_bar = '█' * mem_bar_filled + '░' * (mem_bar_width - mem_bar_filled)
+            # ── ROW 2: MEM + PERF (side by side) ──────────────────────
+            y = mod_header('MEM', y, 0, C_HEADER_MEM)
+            mem = self.memory_info or {}
+            mem_usage = mem.get('percent', 0)
+            mem_used = mem.get('used', 0)
+            mem_total = mem.get('total', 0)
 
-            mem_line = f'│ Mem: {mem_usage:4.1f}% {mem_bar} {mem_used:.1f}/{mem_total:.1f}GB'
-            mem_line = mem_line.ljust(mid_x - 1) + '│'
-            try:
-                self.stdscr.addstr(row2_y, 0, mem_line[:width-1], color_for(mem_usage))
-            except curses.error:
-                pass
+            y = bar_row('Used', f'{mem_usage:5.1f}%', mem_usage, y, 0)
+            y = kv_row('Size', f'{mem_used:.1f}/{mem_total:.1f}GB', y, 0)
 
-            # CPU mini graph (right side of row 2)
-            cpu_graph_line = f' [{self._draw_mini_graph(list(self.cpu_usage_history), width=30)}]'
-            cpu_graph_line = cpu_graph_line.ljust(width - right_x - 1) + '│'
-            try:
-                self.stdscr.addstr(row2_y, right_x, cpu_graph_line[:width-right_x-1], C_GREEN)
-            except curses.error:
-                pass
+            y += 1  # Gap
 
-            # ── Separator ───────────────────────────────────────────────
-            sep_y = 3
-            sep = '├' + '─' * (mid_x - 2) + '┼' + '─' * (width - mid_x - 2) + '┤'
-            try:
-                self.stdscr.addstr(sep_y, 0, sep[:width-1], C_WHITE)
-            except curses.error:
-                pass
-
-            # ── Row 3: TPS metrics │ Tokens ─────────────────────────────
-            row3_y = 4
-            stats = self.stats if self.stats else {}
+            # PERF module (right col, aligned with MEM start)
+            perf_y = y - 4
+            stats = self.stats or {}
             tps = stats.get('tokens_per_second', 0)
-            prompt_tps = stats.get('prompt_eval_per_second', 0)
             cache_hit = stats.get('cache_hit_rate', 0)
             running = stats.get('running_requests', 0)
-            eval_count = stats.get('eval_count', 0)
-            prompt_count = stats.get('prompt_eval_count', 0)
 
-            # TPS bar (mini)
-            tps_bar_width = 15
+            perf_y = mod_header('PERF', perf_y, mid_x, C_HEADER_PERF)
+
             tps_max = max(max(self.tps_history), 50) if self.tps_history else 50
-            tps_bar_filled = min(int(tps / tps_max * tps_bar_width), tps_bar_width)
-            tps_bar = '█' * tps_bar_filled + '░' * (tps_bar_width - tps_bar_filled)
+            tps_bar_width = 12
+            tps_filled = min(int(tps / tps_max * tps_bar_width), tps_bar_width)
+            tps_bar = '█' * tps_filled + '░' * (tps_bar_width - tps_filled)
+            tps_color = CP(2) if tps > 40 else (CP(11) if tps > 20 else CP(9))
 
-            tps_color = C_GREEN if tps > 40 else (C_YELLOW if tps > 20 else CP(14))
-
-            metrics_line = f'│ TPS: {tps:5.1f} {tps_bar}'
-            metrics_line += f' cache: {cache_hit:4.0f}%' if cache_hit > 0 else ' cache:  N/A '
-            metrics_line += f' prompt: {prompt_count:,}' if prompt_count > 0 else ''
-            metrics_line = metrics_line.ljust(width - 1) + '│'
             try:
-                self.stdscr.addstr(row3_y, 0, metrics_line[:width-1], tps_color)
+                self.stdscr.addstr(perf_y, mid_x + 2, '  TPS   ')
+                self.stdscr.addstr(perf_y, mid_x + 10, f'{tps_bar} {tps:5.1f}', tps_color)
+            except curses.error:
+                pass
+            perf_y += 1
+
+            cache_str = f'{cache_hit:.0f}%' if cache_hit > 0 else 'N/A'
+            perf_y = kv_row('Cache', cache_str, perf_y, mid_x)
+            perf_y = kv_row('Run', str(running), perf_y, mid_x)
+
+            # TPS sparkline
+            tps_spark = self._draw_mini_graph(list(self.tps_history), width=min(24, content_width - 4))
+            try:
+                self.stdscr.addstr(perf_y, mid_x + 2, f'  ▁▂▃▅▇ {tps_spark}', CP(21) | C_DIM)
             except curses.error:
                 pass
 
-            # ── Separator ───────────────────────────────────────────────
-            sep2_y = 5
-            sep2 = '├' + '─' * (width - 2) + '┤'
-            try:
-                self.stdscr.addstr(sep2_y, 0, sep2[:width-1], C_WHITE)
-            except curses.error:
-                pass
+            y += 2  # Gap before tasks
 
-            # ── Row 4: Task progress ─────────────────────────────────────
-            row4_y = 6
+            # ── ROW 3: TASKS (full width) ─────────────────────────────
+            y = mod_header('TASKS', y, 0, C_HEADER_TASK)
 
-            # Get active task info
             active_tasks = [t for t in self.tasks if t.get('status') == 'running']
             queued_count = len([t for t in self.tasks if t.get('status') == 'queued'])
 
@@ -1973,46 +1995,51 @@ class TTUInterface:
                 stage = task.get('stage', 'decode')
                 progress = task.get('progress', 0)
                 tokens_gen = task.get('tokens_generated', 0)
-                tokens_rem = task.get('tokens_remain', 0)
 
-                stage_color = C_CYAN if stage == 'prefill' else C_MAGENTA
+                stage_color = CP(19) if stage == 'prefill' else CP(20)
                 stage_str = self.i18n.get(stage).upper() if stage in ['prefill', 'decode', 'waiting'] else stage.upper()
 
                 prog_bar_width = 20
                 prog_bar_filled = int(progress / 100 * prog_bar_width)
                 prog_bar = '█' * prog_bar_filled + '░' * (prog_bar_width - prog_bar_filled)
 
-                task_line = f'│ ● Running: {stage_str} [{prog_bar}] {progress:3d}%'
-                task_line += f' out: {tokens_gen:,}' if tokens_gen > 0 else ''
+                try:
+                    self.stdscr.addstr(y, 2, f'  ● {stage_str}  [{prog_bar}]  {progress:3d}%', stage_color)
+                    if tokens_gen > 0:
+                        self.stdscr.addstr(y, 55, f'  out: {tokens_gen:,}', C_LABEL)
+                except curses.error:
+                    pass
+                y += 1
+
                 if queued_count > 0:
-                    task_line += f' │ ○ Queued: {queued_count} tasks waiting'
+                    suffix = 's' if queued_count > 1 else ''
+                    try:
+                        self.stdscr.addstr(y, 2, f'  ○ Queued: {queued_count} task{suffix} waiting', C_LABEL)
+                    except curses.error:
+                        pass
+                    y += 1
             else:
-                task_line = f'│ ● Running: IDLE'
+                try:
+                    self.stdscr.addstr(y, 2, '  ●  No active tasks', C_LABEL)
+                except curses.error:
+                    pass
+                y += 1
+
                 if queued_count > 0:
-                    task_line += f' │ ○ Queued: {queued_count} tasks waiting'
+                    suffix = 's' if queued_count > 1 else ''
+                    try:
+                        self.stdscr.addstr(y, 2, f'  ○ Queued: {queued_count} task{suffix} waiting', C_LABEL)
+                    except curses.error:
+                        pass
+                    y += 1
 
-            task_line = task_line.ljust(width - 1) + '│'
-            try:
-                self.stdscr.addstr(row4_y, 0, task_line[:width-1], C_MAGENTA)
-            except curses.error:
-                pass
-
-            # ── Bottom border ────────────────────────────────────────────
-            bottom_y = 7
-            bottom = '└' + '─' * (width - 2) + '┘'
-            try:
-                self.stdscr.addstr(bottom_y, 0, bottom[:width-1], C_WHITE)
-            except curses.error:
-                pass
-
-            # ── Footer ───────────────────────────────────────────────────
+            # ── FOOTER ─────────────────────────────────────────────────
             footer_y = height - 1
-            shortcuts = '  Q=quit  +=faster  -=slower  R=refresh  M=language'
+            shortcuts = '  Q=quit  +=slower  -=faster  R=refresh  M=language'
             rate_str = f'Rate: {self.refresh_interval*1000:.0f}ms'
-            time_str = self.last_update.strftime('%H:%M:%S') if self.last_update else '--:--:--'
-            footer = shortcuts + ' ' * max(0, width - len(shortcuts) - len(rate_str) - len(time_str) - 5) + f'{rate_str}  {time_str}'
+            footer = shortcuts + ' ' * max(0, width - len(shortcuts) - len(rate_str) - 3) + rate_str
             try:
-                self.stdscr.addstr(footer_y, 0, footer[:width-1], C_WHITE | curses.A_DIM)
+                self.stdscr.addstr(footer_y, 0, footer[:width-1], C_LABEL)
             except curses.error:
                 pass
 
