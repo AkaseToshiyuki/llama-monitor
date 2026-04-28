@@ -10,6 +10,8 @@ RATE="1"
 LANG="zh"
 LOG_DIR="$HOME/llama-monitor/logs"
 DEBUG=""
+UI_STYLE="${UI_STYLE:-default}"
+export UI_STYLE
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Run the monitor
+export UI_STYLE
 python3 llama_monitor.py \
     -u "$URL" \
     -r "$RATE" \
