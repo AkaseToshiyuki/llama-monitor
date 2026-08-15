@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-LLAMA.cpp Monitor - Real-time monitoring tool for llama-server
+llama-monitor - Real-time monitoring for llama.cpp and vLLM
 
-A cross-platform CLI tool to monitor LLAMA.cpp (llama-server) status
-with beautiful 256-color TUI interface.
+A cross-platform CLI tool with a btop-inspired 256-color TUI.
 
-Author: LLAMA.cpp Monitor Team
-Version: 1.0.0
+Author: AkaseToshiyuki
+Version: 1.1.0
 """
 
 import argparse
@@ -17,19 +16,23 @@ import os
 import platform
 import socket
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
+
+from llama_monitor_core import BackendKind, SystemScope, detect_backend, parse_prometheus_metrics
 
 # Type hints for optional imports
 try:
     import pynvml
+
     PYNVML_AVAILABLE = True
 except ImportError:
     PYNVML_AVAILABLE = False
@@ -37,6 +40,7 @@ except ImportError:
 
 try:
     import psutil
+
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
@@ -45,6 +49,7 @@ except ImportError:
 # AMD GPU support (experimental)
 try:
     import amdsmi
+
     AMDSMI_AVAILABLE = True
 except ImportError:
     AMDSMI_AVAILABLE = False
@@ -56,20 +61,16 @@ GPU_SUPPORTED = False
 
 # Apple Metal GPU support (macOS only)
 METAL_AVAILABLE = False
-if platform.system() == 'Darwin':
-    try:
-        import ctypes
-        # Basic Metal support check - C bindings exist on macOS
-        METAL_AVAILABLE = True
-    except ImportError:
-        METAL_AVAILABLE = False
+if platform.system() == "Darwin":
+    # Metal is part of macOS; telemetry collection performs the actual check.
+    METAL_AVAILABLE = True
 
 # Intel GPU support (Linux only, via sysfs)
 INTEL_AVAILABLE = False
-if platform.system() == 'Linux':
+if platform.system() == "Linux":
     try:
-        result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-        if 'Intel' in result.stdout and 'VGA' in result.stdout:
+        result = subprocess.run(["lspci"], capture_output=True, text=True, timeout=5)
+        if "Intel" in result.stdout and "VGA" in result.stdout:
             INTEL_AVAILABLE = True
     except Exception:
         pass
@@ -77,198 +78,232 @@ if platform.system() == 'Linux':
 # Final GPU support flag
 GPU_SUPPORTED = PYNVML_AVAILABLE or AMDSMI_AVAILABLE or METAL_AVAILABLE or INTEL_AVAILABLE
 
+
+def display_model_name(value: Any) -> str:
+    """Return a presentable model name without exposing a local path."""
+    text = str(value or "Unknown").rstrip("/\\")
+    return text.replace("\\", "/").rsplit("/", 1)[-1] or "Unknown"
+
+
+def validate_server_url(value: str) -> str:
+    """Allow only complete HTTP(S) server URLs used by the monitor."""
+    url = value.strip().rstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must be a complete http:// or https:// address")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing credentials are not supported")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Server URLs must not contain a query string or fragment")
+    return url
+
+
+def is_local_server(value: str) -> bool:
+    """Return whether a server URL clearly targets the current machine."""
+    hostname = (urlparse(value).hostname or "").lower()
+    return hostname in {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "::",
+        socket.gethostname().lower(),
+        socket.getfqdn().lower(),
+    }
+
+
 # ============================================================================
 # Internationalization (i18n)
 # ============================================================================
 
 TRANSLATIONS = {
-    'zh': {
-        'title': 'LLAMA.cpp Monitor',
-        'cpu_info': 'CPU 信息',
-        'gpu_info': 'GPU 信息',
-        'model_status': '模型状态',
-        'realtime_metrics': '实时指标',
-        'active_tasks': '活跃任务',
-        'waiting_tasks': '等待任务',
-        'system_info': '系统信息',
-        'model': '模型',
-        'state': '状态',
-        'context': '上下文',
-        'batch': '批处理',
-        'usage': '占用率',
-        'freq': '频率',
-        'gpu_usage': 'GPU 占用',
-        'vram': '显存',
-        'temp': '温度',
-        'gpu_freq': 'GPU 频率',
-        'fan_speed': '风扇',
-        'power': '功率',
-        'not_available': '不可用',
-        'metrics_disabled': '服务端未启用metrics',
-        'running': '运行中',
-        'queued': '排队中',
-        'completed': '已完成',
-        'failed': '失败',
-        'prefill': '预处理',
-        'decode': '解码',
-        'waiting': '等待中',
-        'tokens_per_sec': 'Token/秒',
-        'prompt_eval': '提示词评估',
-        'decoding': '解码',
-        'cache_hit': '缓存命中率',
-        'tasks_active': '活跃',
-        'tasks_queued': '排队',
-        'tasks_completed': '完成',
-        'avg_tps_1m': '平均 TPS(1 分)',
-        'avg_tps_5m': '平均 TPS(5 分)',
-        'last_update': '最后更新',
-        'refresh': '刷新',
-        'log_path': '日志路径',
-        'language': '语言',
-        'detail_mode': '详细模式',
-        'quit': '退出',
-        'connecting': '正在连接',
-        'connected': '已连接',
-        'connect_failed': '连接失败',
-        'probe_endpoints': '探测端点',
-        'manual_input': '手动输入',
-        'press_enter': '按回车确认',
-        'invalid_url': '无效的 URL',
-        'help': '帮助',
-        'shortcuts': '快捷键',
-        'refresh_now': '手动刷新',
-        'show_log': '显示日志路径',
-        'toggle_lang': '切换语言',
-        'toggle_detail': '切换详细/简洁',
-        'quick_quit': '快速退出',
-        'exit_graceful': '优雅退出',
-        'version': '版本',
-        'no_tasks': '无活跃任务',
-        'gpu_not_detected': '未检测到 NVIDIA GPU',
-        'gpu_init_failed': 'GPU 监控初始化失败',
-        'log_rotation': '日志轮转',
-        'log_info': '信息',
-        'log_warn': '警告',
-        'log_error': '错误',
-        'log_debug': '调试',
-        'task_id': '任务 ID',
-        'status': '状态',
-        'stage': '阶段',
-        'progress': '进度',
-        'tps': 'TPS',
-        'tokens': 'tokens',
-        'avg': '平均',
-        'queue_pos': '队位',
-        'memory': '内存',
-        'mem_usage': '内存占用',
-        'cpu_model': '型号',
-        'mem_type': '类型',
-        'mem_freq': '频率',
-        'slots': '插槽',
+    "zh": {
+        "title": "LLAMA.cpp Monitor",
+        "cpu_info": "CPU 信息",
+        "gpu_info": "GPU 信息",
+        "model_status": "模型状态",
+        "realtime_metrics": "实时指标",
+        "active_tasks": "活跃任务",
+        "waiting_tasks": "等待任务",
+        "system_info": "系统信息",
+        "model": "模型",
+        "state": "状态",
+        "context": "上下文",
+        "batch": "批处理",
+        "usage": "占用率",
+        "freq": "频率",
+        "gpu_usage": "GPU 占用",
+        "vram": "显存",
+        "temp": "温度",
+        "gpu_freq": "GPU 频率",
+        "fan_speed": "风扇",
+        "power": "功率",
+        "not_available": "不可用",
+        "metrics_disabled": "服务端未启用metrics",
+        "running": "运行中",
+        "queued": "排队中",
+        "completed": "已完成",
+        "failed": "失败",
+        "prefill": "预处理",
+        "decode": "解码",
+        "waiting": "等待中",
+        "tokens_per_sec": "Token/秒",
+        "prompt_eval": "提示词评估",
+        "decoding": "解码",
+        "cache_hit": "缓存命中率",
+        "tasks_active": "活跃",
+        "tasks_queued": "排队",
+        "tasks_completed": "完成",
+        "avg_tps_1m": "平均 TPS(1 分)",
+        "avg_tps_5m": "平均 TPS(5 分)",
+        "last_update": "最后更新",
+        "refresh": "刷新",
+        "log_path": "日志路径",
+        "language": "语言",
+        "detail_mode": "详细模式",
+        "quit": "退出",
+        "connecting": "正在连接",
+        "connected": "已连接",
+        "connect_failed": "连接失败",
+        "probe_endpoints": "探测端点",
+        "manual_input": "手动输入",
+        "press_enter": "按回车确认",
+        "invalid_url": "无效的 URL",
+        "help": "帮助",
+        "shortcuts": "快捷键",
+        "refresh_now": "手动刷新",
+        "show_log": "显示日志路径",
+        "toggle_lang": "切换语言",
+        "toggle_detail": "切换详细/简洁",
+        "quick_quit": "快速退出",
+        "exit_graceful": "优雅退出",
+        "version": "版本",
+        "no_tasks": "无活跃任务",
+        "gpu_not_detected": "未检测到 NVIDIA GPU",
+        "gpu_init_failed": "GPU 监控初始化失败",
+        "log_rotation": "日志轮转",
+        "log_info": "信息",
+        "log_warn": "警告",
+        "log_error": "错误",
+        "log_debug": "调试",
+        "task_id": "任务 ID",
+        "status": "状态",
+        "stage": "阶段",
+        "progress": "进度",
+        "tps": "TPS",
+        "tokens": "tokens",
+        "avg": "平均",
+        "queue_pos": "队位",
+        "memory": "内存",
+        "mem_usage": "内存占用",
+        "cpu_model": "型号",
+        "mem_type": "类型",
+        "mem_freq": "频率",
+        "slots": "插槽",
     },
-    'en': {
-        'title': 'LLAMA.cpp Monitor',
-        'cpu_info': 'CPU Info',
-        'gpu_info': 'GPU Info',
-        'model_status': 'Model Status',
-        'realtime_metrics': 'Real-time Metrics',
-        'active_tasks': 'Active Tasks',
-        'waiting_tasks': 'Waiting Tasks',
-        'system_info': 'System Info',
-        'model': 'Model',
-        'state': 'State',
-        'context': 'Context',
-        'batch': 'Batch',
-        'usage': 'Usage',
-        'freq': 'Freq',
-        'gpu_usage': 'GPU Usage',
-        'vram': 'VRAM',
-        'temp': 'Temp',
-        'gpu_freq': 'GPU Freq',
-        'fan_speed': 'Fan',
-        'power': 'Power',
-        'not_available': 'N/A',
-        'metrics_disabled': 'Server metrics disabled',
-        'running': 'Running',
-        'queued': 'Queued',
-        'completed': 'Completed',
-        'failed': 'Failed',
-        'prefill': 'Prefill',
-        'decode': 'Decode',
-        'waiting': 'Waiting',
-        'tokens_per_sec': 'Tokens/s',
-        'prompt_eval': 'Prompt Eval',
-        'decoding': 'Decoding',
-        'cache_hit': 'Cache Hit',
-        'tasks_active': 'Active',
-        'tasks_queued': 'Queued',
-        'tasks_completed': 'Completed',
-        'avg_tps_1m': 'Avg TPS (1m)',
-        'avg_tps_5m': 'Avg TPS (5m)',
-        'last_update': 'Last Update',
-        'refresh': 'Refresh',
-        'log_path': 'Log Path',
-        'language': 'Language',
-        'detail_mode': 'Detail Mode',
-        'quit': 'Quit',
-        'connecting': 'Connecting',
-        'connected': 'Connected',
-        'connect_failed': 'Connection Failed',
-        'probe_endpoints': 'Probe Endpoints',
-        'manual_input': 'Manual Input',
-        'press_enter': 'Press Enter',
-        'invalid_url': 'Invalid URL',
-        'help': 'Help',
-        'shortcuts': 'Shortcuts',
-        'refresh_now': 'Refresh Now',
-        'show_log': 'Show Log Path',
-        'toggle_lang': 'Toggle Language',
-        'toggle_detail': 'Toggle Detail/Simple',
-        'quick_quit': 'Quick Quit',
-        'exit_graceful': 'Graceful Exit',
-        'version': 'Version',
-        'no_tasks': 'No Active Tasks',
-        'gpu_not_detected': 'No NVIDIA GPU Detected',
-        'gpu_init_failed': 'GPU Monitor Init Failed',
-        'log_rotation': 'Log Rotation',
-        'log_info': 'Info',
-        'log_warn': 'Warning',
-        'log_debug': 'Debug',
-        'task_id': 'Task ID',
-        'status': 'Status',
-        'stage': 'Stage',
-        'progress': 'Progress',
-        'tps': 'TPS',
-        'tokens': 'tokens',
-        'avg': 'Avg',
-        'queue_pos': 'Queue',
-        'memory': 'Memory',
-        'mem_usage': 'Mem Usage',
-        'cpu_model': 'Model',
-        'mem_type': 'Type',
-        'mem_freq': 'Freq',
-        'slots': 'Slots',
-    }
+    "en": {
+        "title": "LLAMA.cpp Monitor",
+        "cpu_info": "CPU Info",
+        "gpu_info": "GPU Info",
+        "model_status": "Model Status",
+        "realtime_metrics": "Real-time Metrics",
+        "active_tasks": "Active Tasks",
+        "waiting_tasks": "Waiting Tasks",
+        "system_info": "System Info",
+        "model": "Model",
+        "state": "State",
+        "context": "Context",
+        "batch": "Batch",
+        "usage": "Usage",
+        "freq": "Freq",
+        "gpu_usage": "GPU Usage",
+        "vram": "VRAM",
+        "temp": "Temp",
+        "gpu_freq": "GPU Freq",
+        "fan_speed": "Fan",
+        "power": "Power",
+        "not_available": "N/A",
+        "metrics_disabled": "Server metrics disabled",
+        "running": "Running",
+        "queued": "Queued",
+        "completed": "Completed",
+        "failed": "Failed",
+        "prefill": "Prefill",
+        "decode": "Decode",
+        "waiting": "Waiting",
+        "tokens_per_sec": "Tokens/s",
+        "prompt_eval": "Prompt Eval",
+        "decoding": "Decoding",
+        "cache_hit": "Cache Hit",
+        "tasks_active": "Active",
+        "tasks_queued": "Queued",
+        "tasks_completed": "Completed",
+        "avg_tps_1m": "Avg TPS (1m)",
+        "avg_tps_5m": "Avg TPS (5m)",
+        "last_update": "Last Update",
+        "refresh": "Refresh",
+        "log_path": "Log Path",
+        "language": "Language",
+        "detail_mode": "Detail Mode",
+        "quit": "Quit",
+        "connecting": "Connecting",
+        "connected": "Connected",
+        "connect_failed": "Connection Failed",
+        "probe_endpoints": "Probe Endpoints",
+        "manual_input": "Manual Input",
+        "press_enter": "Press Enter",
+        "invalid_url": "Invalid URL",
+        "help": "Help",
+        "shortcuts": "Shortcuts",
+        "refresh_now": "Refresh Now",
+        "show_log": "Show Log Path",
+        "toggle_lang": "Toggle Language",
+        "toggle_detail": "Toggle Detail/Simple",
+        "quick_quit": "Quick Quit",
+        "exit_graceful": "Graceful Exit",
+        "version": "Version",
+        "no_tasks": "No Active Tasks",
+        "gpu_not_detected": "No NVIDIA GPU Detected",
+        "gpu_init_failed": "GPU Monitor Init Failed",
+        "log_rotation": "Log Rotation",
+        "log_info": "Info",
+        "log_warn": "Warning",
+        "log_debug": "Debug",
+        "task_id": "Task ID",
+        "status": "Status",
+        "stage": "Stage",
+        "progress": "Progress",
+        "tps": "TPS",
+        "tokens": "tokens",
+        "avg": "Avg",
+        "queue_pos": "Queue",
+        "memory": "Memory",
+        "mem_usage": "Mem Usage",
+        "cpu_model": "Model",
+        "mem_type": "Type",
+        "mem_freq": "Freq",
+        "slots": "Slots",
+    },
 }
 
 
 class I18n:
     """Internationalization manager"""
-    
-    def __init__(self, lang: str = 'zh'):
-        self.lang = lang if lang in TRANSLATIONS else 'zh'
-    
+
+    def __init__(self, lang: str = "zh"):
+        self.lang = lang if lang in TRANSLATIONS else "zh"
+
     def set_language(self, lang: str) -> bool:
         if lang in TRANSLATIONS:
             self.lang = lang
             return True
         return False
-    
+
     def get(self, key: str) -> str:
-        return TRANSLATIONS.get(self.lang, TRANSLATIONS['en']).get(key, key)
-    
+        return TRANSLATIONS.get(self.lang, TRANSLATIONS["en"]).get(key, key)
+
     def toggle(self) -> str:
-        self.lang = 'en' if self.lang == 'zh' else 'zh'
+        self.lang = "en" if self.lang == "zh" else "zh"
         return self.lang
 
 
@@ -276,70 +311,64 @@ class I18n:
 # Logging System
 # ============================================================================
 
+
 class LogManager:
     """Manages logging with rotation"""
-    
+
     def __init__(self, log_dir: str, max_size: int = 30 * 1024 * 1024, backup_count: int = 5):
         self.log_dir = log_dir
         self.max_size = max_size
         self.backup_count = backup_count
         self.logger = None
         self._setup_logger()
-    
+
     def _setup_logger(self):
         os.makedirs(self.log_dir, exist_ok=True)
-        
-        log_file = os.path.join(self.log_dir, 'monitor.log')
-        
-        self.logger = logging.getLogger('llama_monitor')
+
+        log_file = os.path.join(self.log_dir, "monitor.log")
+
+        self.logger = logging.getLogger("llama_monitor")
         self.logger.setLevel(logging.DEBUG)
-        
+
         # Clear existing handlers
         self.logger.handlers.clear()
-        
+
         # Rotating file handler
-        handler = RotatingFileHandler(
-            log_file,
-            maxBytes=self.max_size,
-            backupCount=self.backup_count,
-            encoding='utf-8'
-        )
+        handler = RotatingFileHandler(log_file, maxBytes=self.max_size, backupCount=self.backup_count, encoding="utf-8")
         handler.setLevel(logging.DEBUG)
-        
+
         # Console handler (only for errors)
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.ERROR)
-        
+
         # Format
-        formatter = logging.Formatter(
-            '%(asctime)s [%(levelname)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
-        
+
         self.logger.addHandler(handler)
         self.logger.addHandler(console_handler)
-    
+
     def info(self, msg: str):
         self.logger.info(msg)
-    
+
     def warning(self, msg: str):
         self.logger.warning(msg)
-    
+
     def error(self, msg: str):
         self.logger.error(msg)
-    
+
     def debug(self, msg: str):
         self.logger.debug(msg)
-    
+
     def get_log_path(self) -> str:
-        return os.path.join(self.log_dir, 'monitor.log')
+        return os.path.join(self.log_dir, "monitor.log")
 
 
 # ============================================================================
 # System Information Collector
 # ============================================================================
+
 
 class SystemCollector:
     """Collects system information (CPU, GPU)"""
@@ -349,20 +378,22 @@ class SystemCollector:
         self.gpu_initialized = False
         self.gpu_count = 0
         self.gpu_type = None  # 'nvidia' (stable) | 'amd', 'apple', 'intel' (experimental)
-        self.logger = logging.getLogger('llama_monitor')
+        self.logger = logging.getLogger("llama_monitor")
 
         # CPU usage tracking for instant reading
         self._cpu_usage = 0.0
         self._cpu_usage_lock = threading.Lock()
         self._cpu_stop_event = threading.Event()
         self._cpu_thread = None
+        self._memory_hardware: Optional[Tuple[str, int]] = None
 
         # Start background CPU monitoring thread
-        if platform.system() == 'Linux':
+        if platform.system() == "Linux":
             self._start_cpu_thread()
 
     def _start_cpu_thread(self):
         """Start background thread for instant CPU usage reading via /proc/stat"""
+
         def cpu_reader():
             # Read initial CPU times
             prev_idle = prev_total = 0
@@ -370,11 +401,11 @@ class SystemCollector:
 
             while not self._cpu_stop_event.is_set():
                 try:
-                    with open('/proc/stat', 'r') as f:
+                    with open("/proc/stat", "r") as f:
                         cpu_line = f.readline()
                     # cpu  user nice system idle iowait irq softirq steal guest guest_nice
                     fields = cpu_line.split()
-                    if fields[0] == 'cpu':
+                    if fields[0] == "cpu":
                         values = [int(x) for x in fields[1:8]]
                         user, nice, system, idle, iowait, irq, softirq = values
                         idle += iowait
@@ -409,7 +440,7 @@ class SystemCollector:
                     pynvml.nvmlInit()
                     self.gpu_count = pynvml.nvmlDeviceGetCount()
                     self.gpu_initialized = True
-                    self.gpu_type = 'nvidia'
+                    self.gpu_type = "nvidia"
                     self.logger.info(f"GPU monitoring initialized (NVIDIA): {self.gpu_count} device(s)")
                 except Exception as e:
                     self.logger.debug(f"NVIDIA GPU init failed: {e}")
@@ -422,26 +453,28 @@ class SystemCollector:
                     if devices:
                         self.gpu_count = len(devices)
                         self.gpu_initialized = True
-                        self.gpu_type = 'amd'
-                        self.logger.warning(f"GPU monitoring initialized (AMD, experimental): {self.gpu_count} device(s)")
+                        self.gpu_type = "amd"
+                        self.logger.warning(
+                            f"GPU monitoring initialized (AMD, experimental): {self.gpu_count} device(s)"
+                        )
                 except Exception as e:
                     self.logger.debug(f"AMD GPU init failed: {e}")
 
             # Try Apple Metal if NVIDIA and AMD both failed
-            if not self.gpu_initialized and METAL_AVAILABLE and platform.system() == 'Darwin':
+            if not self.gpu_initialized and METAL_AVAILABLE and platform.system() == "Darwin":
                 try:
                     self.gpu_count = 1
                     self.gpu_initialized = True
-                    self.gpu_type = 'apple'
+                    self.gpu_type = "apple"
                     self.logger.warning("GPU monitoring initialized (Apple Metal, experimental)")
                 except Exception as e:
                     self.logger.debug(f"Apple Metal GPU init failed: {e}")
 
             # Try Intel GPU if NVIDIA, AMD, Apple Metal all failed
-            if not self.gpu_initialized and INTEL_AVAILABLE and platform.system() == 'Linux':
+            if not self.gpu_initialized and INTEL_AVAILABLE and platform.system() == "Linux":
                 try:
                     self.gpu_initialized = True
-                    self.gpu_type = 'intel'
+                    self.gpu_type = "intel"
                     self.gpu_count = 1
                     self.logger.warning("GPU monitoring initialized (Intel, experimental)")
                 except Exception as e:
@@ -449,66 +482,71 @@ class SystemCollector:
 
             if not self.gpu_initialized:
                 self.gpu_available = False
-                self.logger.warning("GPU monitoring unavailable (no NVIDIA GPU detected; AMD/Apple/Intel are experimental)")
-    
+                self.logger.warning(
+                    "GPU monitoring unavailable (no NVIDIA GPU detected; AMD/Apple/Intel are experimental)"
+                )
+
     def get_cpu_info(self) -> Dict[str, Any]:
         """Get CPU information"""
         cpu_info = {
-            'model': 'Unknown',
-            'usage': 0.0,
-            'frequency': 0.0,
-            'cores': psutil.cpu_count(logical=False),
-            'threads': psutil.cpu_count(logical=True)
+            "model": "Unknown",
+            "usage": 0.0,
+            "frequency": 0.0,
+            "cores": psutil.cpu_count(logical=False),
+            "threads": psutil.cpu_count(logical=True),
         }
-        
+
         # CPU model
-        if platform.system() == 'Linux':
+        if platform.system() == "Linux":
             try:
-                with open('/proc/cpuinfo', 'r') as f:
+                with open("/proc/cpuinfo", "r") as f:
                     for line in f:
-                        if 'model name' in line:
-                            cpu_info['model'] = line.split(':')[1].strip()
+                        if "model name" in line:
+                            cpu_info["model"] = line.split(":")[1].strip()
                             break
             except Exception as e:
                 self.logger.debug(f"CPU model read failed: {e}")
-        elif platform.system() == 'Darwin':  # macOS
+        elif platform.system() == "Darwin":  # macOS
             try:
-                result = os.popen('sysctl -n machdep.cpu.brand_string').read().strip()
+                result = subprocess.run(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=2, check=False
+                ).stdout.strip()
                 if result:
-                    cpu_info['model'] = result
+                    cpu_info["model"] = result
             except Exception as e:
                 self.logger.debug(f"CPU model read failed (macOS): {e}")
 
         # CPU usage - instant read from background thread (Linux /proc/stat)
         # On non-Linux or if thread failed, fall back to psutil
-        if platform.system() == 'Linux' and self._cpu_thread is not None:
+        if platform.system() == "Linux" and self._cpu_thread is not None:
             with self._cpu_usage_lock:
-                cpu_info['usage'] = self._cpu_usage
+                cpu_info["usage"] = self._cpu_usage
         else:
-            cpu_info['usage'] = psutil.cpu_percent(interval=None)
+            cpu_info["usage"] = psutil.cpu_percent(interval=None)
 
         # CPU frequency - try multiple methods
-        cpu_info['frequency'] = 0.0
+        cpu_info["frequency"] = 0.0
 
         # Method 1: psutil.cpu_freq() - works on most systems
         try:
             freq = psutil.cpu_freq()
             if freq and freq.current > 0:
-                cpu_info['frequency'] = freq.current  # MHz
+                cpu_info["frequency"] = freq.current  # MHz
         except Exception as e:
             self.logger.debug(f"CPU freq via psutil unavailable: {e}")
 
         # Method 2: /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq (Linux)
-        if cpu_info['frequency'] <= 0 and platform.system() == 'Linux':
+        if cpu_info["frequency"] <= 0 and platform.system() == "Linux":
             try:
                 import glob
-                for path in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq'):
+
+                for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
                     try:
-                        with open(path, 'r') as f:
+                        with open(path, "r") as f:
                             # Value is in kHz, convert to MHz
                             val = int(f.read().strip()) / 1000
                             if val > 0:
-                                cpu_info['frequency'] = val
+                                cpu_info["frequency"] = val
                                 break
                     except Exception as e:
                         self.logger.debug(f"CPU freq sysfs read error: {e}")
@@ -516,16 +554,16 @@ class SystemCollector:
                 self.logger.debug(f"CPU freq via sysfs unavailable: {e}")
 
         # Method 3: /proc/cpuinfo (Linux/macOS)
-        if cpu_info['frequency'] <= 0:
+        if cpu_info["frequency"] <= 0:
             try:
-                with open('/proc/cpuinfo', 'r') as f:
+                with open("/proc/cpuinfo", "r") as f:
                     for line in f:
-                        if 'cpu MHz' in line:
-                            parts = line.split(':')
+                        if "cpu MHz" in line:
+                            parts = line.split(":")
                             if len(parts) > 1:
-                                val = parts[1].strip().replace('MHz', '').strip()
+                                val = parts[1].strip().replace("MHz", "").strip()
                                 try:
-                                    cpu_info['frequency'] = float(val)
+                                    cpu_info["frequency"] = float(val)
                                     break
                                 except ValueError as e:
                                     self.logger.debug(f"CPU freq parse error: {e}")
@@ -536,52 +574,47 @@ class SystemCollector:
 
     def get_memory_info(self) -> Dict[str, Any]:
         """Get memory information"""
-        mem_info = {
-            'total': 0.0,
-            'used': 0.0,
-            'available': 0.0,
-            'percent': 0.0,
-            'type': 'Unknown',
-            'frequency': 0
-        }
+        mem_info = {"total": 0.0, "used": 0.0, "available": 0.0, "percent": 0.0, "type": "Unknown", "frequency": 0}
 
         try:
             mem = psutil.virtual_memory()
-            mem_info['total'] = mem.total / (1024 ** 3)  # GB
-            mem_info['used'] = mem.used / (1024 ** 3)   # GB
-            mem_info['available'] = mem.available / (1024 ** 3)  # GB
-            mem_info['percent'] = mem.percent
+            mem_info["total"] = mem.total / (1024**3)  # GB
+            mem_info["used"] = mem.used / (1024**3)  # GB
+            mem_info["available"] = mem.available / (1024**3)  # GB
+            mem_info["percent"] = mem.percent
         except Exception as e:
             self.logger.debug(f"Memory info via psutil unavailable: {e}")
 
-        # Try to get memory type and speed from dmidecode
-        if platform.system() == 'Linux':
+        # Hardware details are static during a session. Cache them so a
+        # privileged process is not spawned at every refresh.
+        if self._memory_hardware is not None:
+            mem_info["type"], mem_info["frequency"] = self._memory_hardware
+        elif platform.system() == "Linux":
             try:
-                import subprocess
                 result = subprocess.run(
-                    ['dmidecode', '--type', 'memory'],
-                    capture_output=True, text=True, timeout=5
+                    ["dmidecode", "--type", "memory"], capture_output=True, text=True, timeout=2, check=False
                 )
                 if result.returncode == 0:
-                    lines = result.stdout.split('\n')
+                    lines = result.stdout.split("\n")
                     for i, line in enumerate(lines):
                         # Look for memory type
-                        if 'Type:' in line and 'Detail' not in line:
-                            mem_type = line.split(':')[1].strip()
-                            if mem_type and mem_type != 'Unknown':
-                                mem_info['type'] = mem_type
+                        if "Type:" in line and "Detail" not in line:
+                            mem_type = line.split(":")[1].strip()
+                            if mem_type and mem_type != "Unknown":
+                                mem_info["type"] = mem_type
                         # Look for speed (frequency)
-                        if 'Speed:' in line and 'Detail' not in line:
-                            speed_str = line.split(':')[1].strip()
+                        if "Speed:" in line and "Detail" not in line:
+                            speed_str = line.split(":")[1].strip()
                             # Format: "3600 MT/s" or "Unknown"
-                            if 'MT/s' in speed_str:
+                            if "MT/s" in speed_str:
                                 try:
-                                    mem_info['frequency'] = int(speed_str.split()[0])
+                                    mem_info["frequency"] = int(speed_str.split()[0])
                                 except ValueError as e:
                                     self.logger.debug(f"Memory speed parse error: {e}")
                             break  # Only take first memory stick info
             except Exception as e:
                 self.logger.debug(f"Memory type/freq via dmidecode unavailable: {e}")
+            self._memory_hardware = (mem_info["type"], mem_info["frequency"])
 
         return mem_info
 
@@ -592,13 +625,13 @@ class SystemCollector:
         if not self.gpu_available or not self.gpu_initialized:
             return gpu_info
 
-        if self.gpu_type == 'nvidia':
+        if self.gpu_type == "nvidia":
             return self._get_nvidia_gpu_info()
-        elif self.gpu_type == 'amd':
+        elif self.gpu_type == "amd":
             return self._get_amd_gpu_info()
-        elif self.gpu_type == 'apple':
+        elif self.gpu_type == "apple":
             return self._get_apple_gpu_info()
-        elif self.gpu_type == 'intel':
+        elif self.gpu_type == "intel":
             return self._get_intel_gpu_info()
 
         return gpu_info
@@ -612,60 +645,57 @@ class SystemCollector:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
 
                 gpu_data = {
-                    'index': i,
-                    'name': pynvml.nvmlDeviceGetName(handle),
-                    'type': 'NVIDIA',
-                    'utilization': 0,
-                    'memory_used': 0,
-                    'memory_total': 0,
-                    'temperature': 0,
-                    'gpu_clock': 0,
-                    'mem_clock': 0,
-                    'fan_speed': 0,
-                    'power': 0
+                    "index": i,
+                    "name": pynvml.nvmlDeviceGetName(handle),
+                    "type": "NVIDIA",
+                    "utilization": 0,
+                    "memory_used": 0,
+                    "memory_total": 0,
+                    "temperature": 0,
+                    "gpu_clock": 0,
+                    "mem_clock": 0,
+                    "fan_speed": 0,
+                    "power": 0,
                 }
 
                 try:
                     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    gpu_data['utilization'] = util.gpu
+                    gpu_data["utilization"] = util.gpu
                 except Exception as e:
                     self.logger.debug(f"GPU utilization unavailable: {e}")
 
                 try:
                     memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    gpu_data['memory_used'] = memory.used / (1024 ** 2)  # MB
-                    gpu_data['memory_total'] = memory.total / (1024 ** 2)  # MB
+                    gpu_data["memory_used"] = memory.used / (1024**2)  # MB
+                    gpu_data["memory_total"] = memory.total / (1024**2)  # MB
                 except Exception as e:
                     self.logger.debug(f"GPU memory info unavailable: {e}")
 
                 try:
-                    gpu_data['temperature'] = pynvml.nvmlDeviceGetTemperature(
-                        handle, pynvml.NVML_TEMPERATURE_GPU
-                    )
+                    gpu_data["temperature"] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                 except Exception as e:
                     self.logger.debug(f"GPU temperature unavailable: {e}")
 
                 try:
-                    gpu_data['gpu_clock'] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS) / 1000
+                    gpu_data["gpu_clock"] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS) / 1000
                 except Exception as e:
                     self.logger.debug(f"GPU clock info unavailable: {e}")
 
                 try:
-                    gpu_data['mem_clock'] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM) / 1000
+                    gpu_data["mem_clock"] = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM) / 1000
                 except Exception as e:
                     self.logger.debug(f"GPU mem clock unavailable: {e}")
 
                 try:
-                    gpu_data['fan_speed'] = pynvml.nvmlDeviceGetFanSpeed(handle)
+                    gpu_data["fan_speed"] = pynvml.nvmlDeviceGetFanSpeed(handle)
                 except Exception as e:
                     self.logger.debug(f"GPU fan speed unavailable: {e}")
 
                 try:
                     power = pynvml.nvmlDeviceGetPowerUsage(handle)
-                    gpu_data['power'] = power / 1000  # Convert to Watts
+                    gpu_data["power"] = power / 1000  # Convert to Watts
                 except Exception as e:
                     self.logger.debug(f"GPU power usage unavailable: {e}")
-
 
                 gpu_info.append(gpu_data)
         except Exception as e:
@@ -683,24 +713,24 @@ class SystemCollector:
             for i, device in enumerate(devices):
                 try:
                     gpu_data = {
-                        'index': i,
-                        'name': 'AMD GPU',
-                        'type': 'AMD',
-                        'utilization': 0,
-                        'memory_used': 0,
-                        'memory_total': 0,
-                        'temperature': 0,
-                        'gpu_clock': 0,
-                        'mem_clock': 0,
-                        'fan_speed': 0,
-                        'power': 0
+                        "index": i,
+                        "name": "AMD GPU",
+                        "type": "AMD",
+                        "utilization": 0,
+                        "memory_used": 0,
+                        "memory_total": 0,
+                        "temperature": 0,
+                        "gpu_clock": 0,
+                        "mem_clock": 0,
+                        "fan_speed": 0,
+                        "power": 0,
                     }
 
                     # Get name
                     try:
                         name = amdsmi.amdsmi_get_gpu_device_name(device)
                         if name:
-                            gpu_data['name'] = name
+                            gpu_data["name"] = name
                     except Exception as e:
                         self.logger.debug(f"AMD GPU name unavailable: {e}")
 
@@ -708,7 +738,7 @@ class SystemCollector:
                     try:
                         util = amdsmi.amdsmi_get_gpu_utilization(device)
                         if util:
-                            gpu_data['utilization'] = util.get('gpu_utilization', 0)
+                            gpu_data["utilization"] = util.get("gpu_utilization", 0)
                     except Exception as e:
                         self.logger.debug(f"AMD GPU utilization unavailable: {e}")
 
@@ -716,17 +746,16 @@ class SystemCollector:
                     try:
                         mem = amdsmi.amdsmi_get_gpu_memory_usage(device)
                         if mem:
-                            gpu_data['memory_used'] = mem.get('vram_used', 0) / (1024 ** 2)  # bytes to MB
-                            gpu_data['memory_total'] = mem.get('vram_total', 0) / (1024 ** 2)
+                            gpu_data["memory_used"] = mem.get("vram_used", 0) / (1024**2)  # bytes to MB
+                            gpu_data["memory_total"] = mem.get("vram_total", 0) / (1024**2)
                     except Exception as e:
                         self.logger.debug(f"AMD GPU memory info unavailable: {e}")
-
 
                     # Get temperature
                     try:
                         temp = amdsmi.amdsmi_get_gpu_temperature(device)
                         if temp:
-                            gpu_data['temperature'] = temp.get('temperature', 0)
+                            gpu_data["temperature"] = temp.get("temperature", 0)
                     except Exception as e:
                         self.logger.debug(f"AMD GPU temperature unavailable: {e}")
 
@@ -734,8 +763,8 @@ class SystemCollector:
                     try:
                         clocks = amdsmi.amdsmi_get_gpu_clk_freq(device)
                         if clocks:
-                            gpu_data['gpu_clock'] = clocks.get('sclk', 0) / 1000  # MHz to GHz
-                            gpu_data['mem_clock'] = clocks.get('mclk', 0) / 1000
+                            gpu_data["gpu_clock"] = clocks.get("sclk", 0) / 1000  # MHz to GHz
+                            gpu_data["mem_clock"] = clocks.get("mclk", 0) / 1000
                     except Exception as e:
                         self.logger.debug(f"AMD GPU clock info unavailable: {e}")
 
@@ -743,7 +772,7 @@ class SystemCollector:
                     try:
                         fan = amdsmi.amdsmi_get_gpu_fan_speed(device)
                         if fan:
-                            gpu_data['fan_speed'] = fan.get('fan_speed', 0)
+                            gpu_data["fan_speed"] = fan.get("fan_speed", 0)
                     except Exception as e:
                         self.logger.debug(f"AMD GPU fan speed unavailable: {e}")
 
@@ -751,7 +780,7 @@ class SystemCollector:
                     try:
                         power = amdsmi.amdsmi_get_gpu_power(device)
                         if power:
-                            gpu_data['power'] = power.get('power', 0) / 1000  # mW to W
+                            gpu_data["power"] = power.get("power", 0) / 1000  # mW to W
                     except Exception as e:
                         self.logger.debug(f"AMD GPU power usage unavailable: {e}")
 
@@ -769,35 +798,31 @@ class SystemCollector:
         """Get Intel GPU information via sysfs and lspci"""
         gpu_info = []
         gpu_data = {
-            'index': 0,
-            'name': 'Intel GPU',
-            'type': 'Intel',
-            'utilization': 0,
-            'memory_used': 0,
-            'memory_total': 0,
-            'temperature': 0,
-            'gpu_clock': 0,
-            'mem_clock': 0,
-            'fan_speed': 0,
-            'power': 0
+            "index": 0,
+            "name": "Intel GPU",
+            "type": "Intel",
+            "utilization": 0,
+            "memory_used": 0,
+            "memory_total": 0,
+            "temperature": 0,
+            "gpu_clock": 0,
+            "mem_clock": 0,
+            "fan_speed": 0,
+            "power": 0,
         }
 
         # Get GPU name from lspci
         try:
-            result = subprocess.run(
-                ['lspci', '-mm', '-n'],
-                capture_output=True, text=True, timeout=5
-            )
-            for line in result.stdout.split('\n'):
-                if '0300' in line and 'Intel' in line:
+            result = subprocess.run(["lspci", "-mm", "-n"], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.split("\n"):
+                if "0300" in line and "Intel" in line:
                     name_result = subprocess.run(
-                        ['lspci', '-mm', '-n', '-nn'],
-                        capture_output=True, text=True, timeout=5
+                        ["lspci", "-mm", "-n", "-nn"], capture_output=True, text=True, timeout=5
                     )
-                    for nline in name_result.stdout.split('\n'):
-                        if 'VGA' in nline and 'Intel' in nline:
+                    for nline in name_result.stdout.split("\n"):
+                        if "VGA" in nline and "Intel" in nline:
                             try:
-                                gpu_data['name'] = nline.split('"')[1] if '"' in nline else 'Intel GPU'
+                                gpu_data["name"] = nline.split('"')[1] if '"' in nline else "Intel GPU"
                             except Exception:
                                 pass
                     break
@@ -806,42 +831,42 @@ class SystemCollector:
 
         # Read utilization from sysfs
         try:
-            for card in ['card0', 'card1', 'card2']:
-                busy_path = f'/sys/class/drm/{card}/device/gpu_busy_percent'
+            for card in ["card0", "card1", "card2"]:
+                busy_path = f"/sys/class/drm/{card}/device/gpu_busy_percent"
                 if os.path.exists(busy_path):
-                    with open(busy_path, 'r') as f:
-                        gpu_data['utilization'] = float(f.read().strip())
+                    with open(busy_path, "r") as f:
+                        gpu_data["utilization"] = float(f.read().strip())
                     break
         except Exception as e:
             self.logger.debug(f"Intel GPU utilization unavailable: {e}")
 
         # Read memory info from sysfs
         try:
-            for card in ['card0', 'card1', 'card2']:
-                mem_path = f'/sys/class/drm/{card}/device/mem_info_vram_total'
+            for card in ["card0", "card1", "card2"]:
+                mem_path = f"/sys/class/drm/{card}/device/mem_info_vram_total"
                 if os.path.exists(mem_path):
-                    with open(mem_path, 'r') as f:
-                        gpu_data['memory_total'] = int(f.read().strip()) / (1024 * 1024)  # bytes to MB
-                    used_path = f'/sys/class/drm/{card}/device/mem_info_vram_used'
+                    with open(mem_path, "r") as f:
+                        gpu_data["memory_total"] = int(f.read().strip()) / (1024 * 1024)  # bytes to MB
+                    used_path = f"/sys/class/drm/{card}/device/mem_info_vram_used"
                     if os.path.exists(used_path):
-                        with open(used_path, 'r') as f:
-                            gpu_data['memory_used'] = int(f.read().strip()) / (1024 * 1024)
+                        with open(used_path, "r") as f:
+                            gpu_data["memory_used"] = int(f.read().strip()) / (1024 * 1024)
                     break
         except Exception as e:
             self.logger.debug(f"Intel GPU memory info unavailable: {e}")
 
         # Read GPU clock from sysfs
         try:
-            for card in ['card0', 'card1', 'card2']:
+            for card in ["card0", "card1", "card2"]:
                 paths = [
-                    f'/sys/class/drm/{card}/device/gt_cur_freq_mhz',
-                    f'/sys/class/drm/{card}/device/gt_max_freq_mhz',
+                    f"/sys/class/drm/{card}/device/gt_cur_freq_mhz",
+                    f"/sys/class/drm/{card}/device/gt_max_freq_mhz",
                 ]
                 for fp in paths:
                     if os.path.exists(fp):
-                        with open(fp, 'r') as f:
+                        with open(fp, "r") as f:
                             mhz = int(f.read().strip())
-                            gpu_data['gpu_clock'] = mhz / 1000  # MHz to GHz
+                            gpu_data["gpu_clock"] = mhz / 1000  # MHz to GHz
                         break
         except Exception as e:
             self.logger.debug(f"Intel GPU clock unavailable: {e}")
@@ -853,65 +878,66 @@ class SystemCollector:
         """Get Apple GPU information via system_profiler and powermetrics"""
         gpu_info = []
         gpu_data = {
-            'index': 0,
-            'name': 'Apple GPU',
-            'type': 'Apple',
-            'utilization': 0,
-            'memory_used': 0,
-            'memory_total': 0,
-            'temperature': 0,
-            'gpu_clock': 0,
-            'mem_clock': 0,
-            'fan_speed': 0,
-            'power': 0
+            "index": 0,
+            "name": "Apple GPU",
+            "type": "Apple",
+            "utilization": 0,
+            "memory_used": 0,
+            "memory_total": 0,
+            "temperature": 0,
+            "gpu_clock": 0,
+            "mem_clock": 0,
+            "fan_speed": 0,
+            "power": 0,
         }
 
         # Get GPU name from system_profiler
         try:
             result = subprocess.run(
-                ['system_profiler', 'SPDisplaysDataType', '-json'],
-                capture_output=True, text=True, timeout=5
+                ["system_profiler", "SPDisplaysDataType", "-json"], capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
                 import json
+
                 data = json.loads(result.stdout)
-                if 'SPDisplaysDataType' in data and len(data['SPDisplaysDataType']) > 0:
-                    display = data['SPDisplaysDataType'][0]
-                    gpu_data['name'] = display.get('sppci_model', 'Apple GPU')
+                if "SPDisplaysDataType" in data and len(data["SPDisplaysDataType"]) > 0:
+                    display = data["SPDisplaysDataType"][0]
+                    gpu_data["name"] = display.get("sppci_model", "Apple GPU")
         except Exception as e:
             self.logger.debug(f"Apple GPU name unavailable: {e}")
 
         # Get GPU utilization from powermetrics (requires sudo, fallback gracefully)
         try:
             result = subprocess.run(
-                ['sudo', 'powermetrics', '--samplers', 'gpu', '-i', '1000', '-n', '1'],
-                capture_output=True, text=True, timeout=10
+                ["sudo", "powermetrics", "--samplers", "gpu", "-i", "1000", "-n", "1"],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode == 0:
                 output = result.stdout
                 # Parse gpu_active (activity percentage)
-                for line in output.split('\n'):
-                    if 'gpu_active' in line.lower():
+                for line in output.split("\n"):
+                    if "gpu_active" in line.lower():
                         try:
-                            val = float(''.join(filter(lambda x: x.isdigit() or x == '.', line.split('gpu_active')[-1])))
-                            gpu_data['utilization'] = min(val, 100)
-                        except:
+                            val = float(
+                                "".join(filter(lambda x: x.isdigit() or x == ".", line.split("gpu_active")[-1]))
+                            )
+                            gpu_data["utilization"] = min(val, 100)
+                        except (TypeError, ValueError):
                             pass
         except Exception as e:
             self.logger.debug(f"Apple GPU utilization unavailable: {e}")
 
         # Get memory info from memory_pressure if available
         try:
-            result = subprocess.run(
-                ['sysctl', '-n', 'hw.memsize'],
-                capture_output=True, text=True, timeout=3
-            )
+            result = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3)
             if result.returncode == 0:
                 total_mem = int(result.stdout.strip())
-                gpu_data['memory_total'] = total_mem / (1024 ** 2)  # MB
+                gpu_data["memory_total"] = total_mem / (1024**2)  # MB
                 # Apple shares system memory, approximate VRAM as 1/4 of system RAM for dGPU
-                if 'Apple' not in gpu_data['name'] and 'M' in gpu_data['name']:
-                    gpu_data['memory_total'] = min(gpu_data['memory_total'], 16384)
+                if "Apple" not in gpu_data["name"] and "M" in gpu_data["name"]:
+                    gpu_data["memory_total"] = min(gpu_data["memory_total"], 16384)
         except Exception as e:
             self.logger.debug(f"Apple GPU memory info unavailable: {e}")
 
@@ -922,9 +948,9 @@ class SystemCollector:
         """Cleanup GPU resources"""
         if self.gpu_initialized:
             try:
-                if self.gpu_type == 'nvidia':
+                if self.gpu_type == "nvidia":
                     pynvml.nvmlShutdown()
-                elif self.gpu_type == 'amd':
+                elif self.gpu_type == "amd":
                     amdsmi.amdsmi_shut_down()
             except Exception as e:
                 self.logger.debug(f"GPU cleanup error: {e}")
@@ -936,51 +962,99 @@ class SystemCollector:
 
 
 # ============================================================================
-# LLAMA Server API Client
+# Inference Server API Client
 # ============================================================================
 
+
 class LLAMAServerClient:
-    """Client for llama-server API"""
-    
-    COMMON_ENDPOINTS = [
-        '/metrics',
-        '/props',
-        '/health',
-        '/v1/models',
-        '/v1/chat/completions',
-        '/slots',
-        '/info',
-        '/version'
-    ]
-    
-    def __init__(self, base_url: str, timeout: int = 5):
-        self.base_url = base_url.rstrip('/')
+    """Client for llama.cpp and vLLM OpenAI-compatible API servers."""
+
+    COMMON_ENDPOINTS = ["/metrics", "/props", "/health", "/v1/models", "/slots", "/load", "/info", "/version"]
+    MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+    MAX_DISPLAY_TASK_ROWS = 100
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout: int = 5,
+        backend: str = BackendKind.AUTO.value,
+        api_key: Optional[str] = None,
+        verify: Any = True,
+    ):
+        self.base_url = validate_server_url(base_url)
         self.timeout = timeout
-        self.logger = logging.getLogger('llama_monitor')
+        self.logger = logging.getLogger("llama_monitor")
         self.available_endpoints = {}
+        self.backend_hint = BackendKind(backend)
+        self.backend = (
+            self.backend_hint.value if self.backend_hint != BackendKind.AUTO else BackendKind.OPENAI_COMPATIBLE.value
+        )
+        self.last_scrape_duration = 0.0
+        self.last_scrape_error: Optional[str] = None
+        self.last_status_code: Optional[int] = None
         self.session = requests.Session()
-        self.session.headers.update({
-            'Accept': 'application/json',
-            'User-Agent': 'LLAMA-Monitor/1.0'
-        })
-    
+        self.session.verify = verify
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "llama-monitor/1.1"})
+        if api_key:
+            self.session.headers["Authorization"] = f"Bearer {api_key}"
+        self._last_truncated_waiting: Optional[int] = None
+
+    def _bounded_get(self, url: str, timeout: float, read_body: bool = True) -> requests.Response:
+        """Fetch a response without allowing redirects or unbounded bodies."""
+        response = self.session.get(
+            url,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        if not read_body or response.status_code != 200:
+            response.close()
+            return response
+
+        try:
+            declared_length = response.headers.get("Content-Length")
+            if declared_length:
+                try:
+                    if int(declared_length) > self.MAX_RESPONSE_BYTES:
+                        raise requests.RequestException(f"response exceeds {self.MAX_RESPONSE_BYTES} byte limit")
+                except ValueError:
+                    pass
+
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                if len(body) + len(chunk) > self.MAX_RESPONSE_BYTES:
+                    raise requests.RequestException(f"response exceeds {self.MAX_RESPONSE_BYTES} byte limit")
+                body.extend(chunk)
+            response._content = bytes(body)
+            response._content_consumed = True
+            return response
+        finally:
+            response.close()
+
     def test_connection(self) -> bool:
         """Test basic connection"""
         try:
-            resp = self.session.get(self.base_url, timeout=self.timeout)
-            return resp.status_code < 500
+            resp = self._bounded_get(self.base_url, timeout=self.timeout, read_body=False)
+            return resp.status_code < 500 and resp.status_code not in {401, 403}
         except Exception as e:
             self.logger.debug(f"Connection test failed: {e}")
-    
+            return False
+
     def probe_endpoints(self) -> Dict[str, Any]:
         """Probe common endpoints"""
         self.available_endpoints = {}
-        
+
         for endpoint in self.COMMON_ENDPOINTS:
+            if self.backend == BackendKind.VLLM.value and endpoint in {"/props", "/slots", "/info"}:
+                continue
+            if self.backend == BackendKind.LLAMA_CPP.value and endpoint == "/load":
+                continue
             try:
                 url = f"{self.base_url}{endpoint}"
-                resp = self.session.get(url, timeout=0.5)
-                
+                resp = self._bounded_get(url, timeout=0.5)
+
                 if resp.status_code == 200:
                     try:
                         data = resp.json()
@@ -988,146 +1062,163 @@ class LLAMAServerClient:
                         self.logger.debug(f"Endpoint available: {endpoint}")
                     except json.JSONDecodeError:
                         # Might still be useful (e.g., Prometheus metrics)
-                        self.available_endpoints[endpoint] = {'raw': resp.text}
+                        self.available_endpoints[endpoint] = {"raw": resp.text}
+                    if endpoint == "/metrics" and self.backend_hint == BackendKind.AUTO:
+                        detected = detect_backend(resp.text)
+                        if detected != BackendKind.OPENAI_COMPATIBLE:
+                            self.backend = detected.value
             except Exception as e:
                 self.logger.debug(f"Endpoint {endpoint} not available: {e}")
                 continue
-        
+
+        self._detect_backend()
         return self.available_endpoints
-    
+
+    def _detect_backend(self) -> None:
+        """Identify the telemetry dialect without relying on server branding."""
+        if self.backend_hint != BackendKind.AUTO:
+            self.backend = self.backend_hint.value
+            return
+        metrics = self.available_endpoints.get("/metrics", {})
+        raw_metrics = metrics.get("raw", "") if isinstance(metrics, dict) else str(metrics)
+        self.backend = detect_backend(raw_metrics).value
+        self.logger.debug(f"Detected inference backend: {self.backend}")
+
     def get_model_info(self) -> Dict[str, Any]:
         """Get model information"""
         # First try /props endpoint (llama-server specific)
-        if '/props' in self.available_endpoints:
-            data = self.available_endpoints['/props']
-            if isinstance(data, dict) and 'raw' in data:
+        if "/props" in self.available_endpoints:
+            data = self.available_endpoints["/props"]
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     pass
-            
+
             if isinstance(data, dict):
                 model_info = {}
-                if 'model_path' in data:
-                    model_info['name'] = data['model_path'].split('/')[-1]
-                    self.logger.debug(f"/props model_path: {data['model_path']}")
-                elif 'model_alias' in data:
-                    model_info['name'] = data['model_alias'].split('/')[-1]
-                    self.logger.debug(f"/props model_alias: {data['model_alias']}")
-                elif 'model' in data:
-                    model_info['name'] = data['model']
-                    self.logger.debug(f"/props model: {data['model']}")
-                
+                if "model_path" in data:
+                    model_info["name"] = display_model_name(data["model_path"])
+                    self.logger.debug(f"/props model: {model_info['name']}")
+                elif "model_alias" in data:
+                    model_info["name"] = display_model_name(data["model_alias"])
+                    self.logger.debug(f"/props model: {model_info['name']}")
+                elif "model" in data:
+                    model_info["name"] = display_model_name(data["model"])
+                    self.logger.debug(f"/props model: {model_info['name']}")
+
                 # n_ctx can be in different locations
-                if 'n_ctx' in data:
-                    model_info['context'] = data['n_ctx']
-                elif 'default_generation_settings' in data:
-                    dgs = data['default_generation_settings']
-                    if 'n_ctx' in dgs:
-                        model_info['context'] = dgs['n_ctx']
-                    elif 'params' in dgs and 'n_ctx' in dgs['params']:
-                        model_info['context'] = dgs['params']['n_ctx']
-                
-                if 'n_batch' in data:
-                    model_info['batch'] = data['n_batch']
-                if 'n_gpu_layers' in data:
-                    model_info['gpu_layers'] = data['n_gpu_layers']
-                model_info['state'] = 'Running'
-                
-                if model_info.get('name'):
+                if "n_ctx" in data:
+                    model_info["context"] = data["n_ctx"]
+                elif "default_generation_settings" in data:
+                    dgs = data["default_generation_settings"]
+                    if "n_ctx" in dgs:
+                        model_info["context"] = dgs["n_ctx"]
+                    elif "params" in dgs and "n_ctx" in dgs["params"]:
+                        model_info["context"] = dgs["params"]["n_ctx"]
+
+                if "n_batch" in data:
+                    model_info["batch"] = data["n_batch"]
+                if "n_gpu_layers" in data:
+                    model_info["gpu_layers"] = data["n_gpu_layers"]
+                model_info["state"] = "Running"
+
+                if model_info.get("name"):
                     self.logger.debug(f"Model info from /props: {model_info}")
                     return model_info
-        
+
         # Try /v1/models endpoint (OpenAI compatible)
-        if '/v1/models' in self.available_endpoints:
-            data = self.available_endpoints['/v1/models']
-            if isinstance(data, dict) and 'raw' in data:
+        if "/v1/models" in self.available_endpoints:
+            data = self.available_endpoints["/v1/models"]
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     pass
-            
-            self.logger.debug(f"/v1/models data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'N/A'}")
-            
-            if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0:
-                first_model = data['data'][0]
+
+            self.logger.debug(
+                f"/v1/models data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'N/A'}"
+            )
+
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                first_model = data["data"][0]
                 model_info = {}
-                model_info['name'] = first_model.get('id', first_model.get('name', 'Unknown'))
-                if 'meta' in first_model:
-                    meta = first_model['meta']
-                    if 'n_ctx_train' in meta:
-                        model_info['context'] = meta['n_ctx_train']
-                    if 'n_params' in meta:
-                        model_info['params'] = meta['n_params']
-                model_info['state'] = 'Running'
-                self.logger.debug(f"Model info from /v1/models: {model_info}")
+                model_info["name"] = display_model_name(first_model.get("id", first_model.get("name", "Unknown")))
+                if "meta" in first_model:
+                    meta = first_model["meta"]
+                    if "n_ctx_train" in meta:
+                        model_info["context"] = meta["n_ctx_train"]
+                    if "n_params" in meta:
+                        model_info["params"] = meta["n_params"]
+                model_info["state"] = "Running"
+                self.logger.debug(f"Model info found: {model_info.get('name', 'Unknown')}")
                 return model_info
             elif isinstance(data, dict):
                 self.logger.debug(f"/v1/models available keys: {list(data.keys())}")
-        
+
         # Try /models endpoint
-        if '/models' in self.available_endpoints:
-            data = self.available_endpoints['/models']
-            if isinstance(data, dict) and 'raw' in data:
+        if "/models" in self.available_endpoints:
+            data = self.available_endpoints["/models"]
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     pass
-            
-            if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0:
-                first_model = data['data'][0]
+
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                first_model = data["data"][0]
                 model_info = {}
-                model_info['name'] = first_model.get('id', first_model.get('name', 'Unknown'))
-                if 'meta' in first_model:
-                    meta = first_model['meta']
-                    if 'n_ctx_train' in meta:
-                        model_info['context'] = meta['n_ctx_train']
-                    if 'n_params' in meta:
-                        model_info['params'] = meta['n_params']
-                model_info['state'] = 'Running'
+                model_info["name"] = display_model_name(first_model.get("id", first_model.get("name", "Unknown")))
+                if "meta" in first_model:
+                    meta = first_model["meta"]
+                    if "n_ctx_train" in meta:
+                        model_info["context"] = meta["n_ctx_train"]
+                    if "n_params" in meta:
+                        model_info["params"] = meta["n_params"]
+                model_info["state"] = "Running"
                 return model_info
-        
+
         # Fallback to other endpoints
-        for endpoint in ['/stats', '/health', '/info']:
+        for endpoint in ["/stats", "/health", "/info"]:
             if endpoint in self.available_endpoints:
                 data = self.available_endpoints[endpoint]
                 model_info = {}
-                
-                if isinstance(data, dict) and 'raw' in data:
+
+                if isinstance(data, dict) and "raw" in data:
                     try:
-                        data = json.loads(data['raw'])
+                        data = json.loads(data["raw"])
                     except json.JSONDecodeError:
                         continue
-                
+
                 if isinstance(data, dict):
-                    if 'model' in data:
-                        model_info['name'] = data['model']
-                    if 'model_path' in data:
-                        model_info['name'] = data['model_path']
-                    if 'n_ctx' in data:
-                        model_info['context'] = data['n_ctx']
-                    if 'n_batch' in data:
-                        model_info['batch'] = data['n_batch']
-                    if 'state' in data:
-                        model_info['state'] = data['state']
-                    if 'loaded' in data:
-                        model_info['state'] = 'Running' if data['loaded'] else 'Not loaded'
-                    
-                    if model_info.get('name'):
+                    if "model" in data:
+                        model_info["name"] = display_model_name(data["model"])
+                    if "model_path" in data:
+                        model_info["name"] = display_model_name(data["model_path"])
+                    if "n_ctx" in data:
+                        model_info["context"] = data["n_ctx"]
+                    if "n_batch" in data:
+                        model_info["batch"] = data["n_batch"]
+                    if "state" in data:
+                        model_info["state"] = data["state"]
+                    if "loaded" in data:
+                        model_info["state"] = "Running" if data["loaded"] else "Not loaded"
+
+                    if model_info.get("name"):
                         return model_info
-        
+
         return {}
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get runtime statistics"""
         # First try cached endpoints
-        for endpoint in ['/stats', '/v1/stats']:
+        for endpoint in ["/stats", "/v1/stats"]:
             if endpoint in self.available_endpoints:
                 data = self.available_endpoints[endpoint]
                 # Handle raw text format
-                if isinstance(data, dict) and 'raw' in data:
+                if isinstance(data, dict) and "raw" in data:
                     try:
-                        data = json.loads(data['raw'])
+                        data = json.loads(data["raw"])
                     except json.JSONDecodeError:
                         continue
                 if isinstance(data, dict):
@@ -1135,22 +1226,22 @@ class LLAMAServerClient:
                     return data
 
         # Try to parse Prometheus metrics from cache
-        if '/metrics' in self.available_endpoints:
-            data = self.available_endpoints['/metrics']
+        if "/metrics" in self.available_endpoints:
+            data = self.available_endpoints["/metrics"]
             if isinstance(data, str):
                 stats = self._parse_prometheus_metrics(data)
                 if stats:
                     self.logger.debug("Got stats from /metrics (cached string)")
                     return stats
-            elif isinstance(data, dict) and 'raw' in data:
-                stats = self._parse_prometheus_metrics(data['raw'])
+            elif isinstance(data, dict) and "raw" in data:
+                stats = self._parse_prometheus_metrics(data["raw"])
                 if stats:
                     self.logger.debug("Got stats from /metrics (cached dict)")
                     return stats
 
         # Fallback: directly query /metrics endpoint for fresh data
         try:
-            resp = self.session.get(f"{self.base_url}/metrics", timeout=0.5)
+            resp = self._bounded_get(f"{self.base_url}/metrics", timeout=0.5)
             if resp.status_code == 200:
                 stats = self._parse_prometheus_metrics(resp.text)
                 if stats:
@@ -1160,233 +1251,206 @@ class LLAMAServerClient:
             self.logger.debug(f"Direct /metrics query failed: {e}")
 
         return {}
-    
+
+    def fetch_metrics_text(self) -> Optional[str]:
+        """Fetch one fresh Prometheus payload for the current refresh cycle."""
+        started = time.monotonic()
+        try:
+            resp = self._bounded_get(f"{self.base_url}/metrics", timeout=0.75)
+            self.last_status_code = resp.status_code
+            if resp.status_code in {401, 403}:
+                self.last_scrape_error = f"HTTP {resp.status_code}: authentication rejected"
+                self.logger.warning("Metrics endpoint rejected authentication")
+                return None
+            if resp.status_code != 200:
+                self.last_scrape_error = f"HTTP {resp.status_code}"
+                self.logger.debug(f"Metrics endpoint returned HTTP {resp.status_code}")
+                return None
+            detected = detect_backend(resp.text)
+            if self.backend_hint == BackendKind.AUTO and detected != BackendKind.OPENAI_COMPATIBLE:
+                self.backend = detected.value
+            self.last_scrape_error = None
+            return resp.text
+        except requests.RequestException as e:
+            self.last_status_code = None
+            self.last_scrape_error = e.__class__.__name__
+            self.logger.debug(f"Metrics query failed: {e}")
+            return None
+        finally:
+            self.last_scrape_duration = time.monotonic() - started
+
     def get_tasks(self) -> List[Dict[str, Any]]:
         """Get task/queue information"""
         tasks = []
-        
+
         # Try to get from /queue endpoint
-        if '/queue' in self.available_endpoints:
-            data = self.available_endpoints['/queue']
+        if "/queue" in self.available_endpoints:
+            data = self.available_endpoints["/queue"]
             # Handle raw text
-            if isinstance(data, dict) and 'raw' in data:
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     data = None
             if isinstance(data, list):
                 tasks.extend(self._parse_task_list(data))
-        
+
         # Try to get from /stats
-        if '/stats' in self.available_endpoints:
-            data = self.available_endpoints['/stats']
+        if "/stats" in self.available_endpoints:
+            data = self.available_endpoints["/stats"]
             # Handle raw text
-            if isinstance(data, dict) and 'raw' in data:
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     data = None
             if isinstance(data, dict):
                 tasks.extend(self._parse_stats_tasks(data))
-        
+
         # Try /v1/queue for newer versions
-        if '/v1/queue' in self.available_endpoints:
-            data = self.available_endpoints['/v1/queue']
+        if "/v1/queue" in self.available_endpoints:
+            data = self.available_endpoints["/v1/queue"]
             # Handle raw text
-            if isinstance(data, dict) and 'raw' in data:
+            if isinstance(data, dict) and "raw" in data:
                 try:
-                    data = json.loads(data['raw'])
+                    data = json.loads(data["raw"])
                 except json.JSONDecodeError:
                     data = None
             if isinstance(data, list):
                 tasks.extend(self._parse_task_list(data))
-        
+
         # If no tasks from queue, try to create fake tasks from metrics
-        if not tasks and '/metrics' in self.available_endpoints:
-            data = self.available_endpoints['/metrics']
+        if not tasks and "/metrics" in self.available_endpoints:
+            data = self.available_endpoints["/metrics"]
             metrics_text = None
             if isinstance(data, str):
                 metrics_text = data
-            elif isinstance(data, dict) and 'raw' in data:
-                metrics_text = data['raw']
-            
+            elif isinstance(data, dict) and "raw" in data:
+                metrics_text = data["raw"]
+
             if metrics_text:
                 stats = self._parse_prometheus_metrics(metrics_text)
-                if stats.get('running_requests', 0) > 0:
+                if stats.get("running_requests", 0) > 0:
                     tasks.extend(self._create_tasks_from_stats(stats))
-        
+
         return tasks
-    
+
     def _parse_task_list(self, data: List) -> List[Dict[str, Any]]:
         """Parse task list from queue endpoint"""
         tasks = []
         for i, task in enumerate(data):
             task_info = {
-                'id': task.get('id', i),
-                'status': 'running' if task.get('running') else 'queued',
-                'stage': self._detect_stage(task),
-                'progress': task.get('progress', 0),
-                'tokens_generated': task.get('tokens_generated', 0),
-                'tokens_total': task.get('tokens_total', 0),
-                'tps': task.get('tps', 0),
-                'queue_position': task.get('queue_position', i + 1)
+                "id": task.get("id", i),
+                "status": "running" if task.get("running") else "queued",
+                "stage": self._detect_stage(task),
+                "progress": task.get("progress", 0),
+                "tokens_generated": task.get("tokens_generated", 0),
+                "tokens_total": task.get("tokens_total", 0),
+                "tps": task.get("tps", 0),
+                "queue_position": task.get("queue_position", i + 1),
             }
             tasks.append(task_info)
         return tasks
-    
+
     def _parse_stats_tasks(self, data: Dict) -> List[Dict[str, Any]]:
         """Parse task info from stats endpoint"""
         tasks = []
-        
+
         # Common llama-server stats fields
-        if 'running_requests' in data:
-            count = data['running_requests']
+        if "running_requests" in data:
+            count = data["running_requests"]
             if count > 0:
                 for i in range(count):
-                    tasks.append({
-                        'id': i + 1,
-                        'status': 'running',
-                        'stage': 'decode',  # Assume decode for running
-                        'tokens_generated': data.get('eval_count', 0),
-                        'tps': data.get('tokens_per_second', 0)
-                    })
-        
+                    tasks.append(
+                        {
+                            "id": i + 1,
+                            "status": "running",
+                            "stage": "decode",  # Assume decode for running
+                            "tokens_generated": data.get("eval_count", 0),
+                            "tps": data.get("tokens_per_second", 0),
+                        }
+                    )
+
         return tasks
-    
+
     def _parse_metrics_tasks(self, data: Dict) -> List[Dict[str, Any]]:
         """Parse task info from metrics endpoint"""
         tasks = []
-        
+
         # This is a fallback - real metrics parsing depends on format
-        if 'running_tasks' in data:
-            count = data['running_tasks']
+        if "running_tasks" in data:
+            count = data["running_tasks"]
             if count > 0:
-                tps = data.get('avg_tokens_per_second', 0)
+                tps = data.get("avg_tokens_per_second", 0)
                 for i in range(count):
-                    tasks.append({
-                        'id': i + 1,
-                        'status': 'running',
-                        'stage': 'decode',
-                        'tps': tps
-                    })
-        
+                    tasks.append({"id": i + 1, "status": "running", "stage": "decode", "tps": tps})
+
         return tasks
-    
+
     def _parse_prometheus_metrics(self, metrics_text: str) -> Dict[str, Any]:
-        """Parse Prometheus format metrics"""
-        stats = {}
-        
-        try:
-            for line in metrics_text.split('\n'):
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
-                # Parse metric: metric_name{labels} value or metric_name value
-                if '{' in line:
-                    parts = line.split('{', 1)
-                    if len(parts) >= 2:
-                        metric_name = parts[0].strip()
-                        rest = parts[1].split('}', 1)
-                        if len(rest) >= 2:
-                            value_str = rest[1].strip()
-                            try:
-                                value = float(value_str)
-                            except ValueError:
-                                continue
-                            self._map_metric(metric_name, value, stats)
-                else:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        metric_name = parts[0]
-                        try:
-                            value = float(parts[1])
-                        except ValueError:
-                            continue
-                        self._map_metric(metric_name, value, stats)
-                        
-        except Exception as e:
-            self.logger.debug(f"Error parsing Prometheus metrics: {e}")
-        
-        # Calculate derived metrics
-        if 'eval_count' in stats and 'total_decode_time' in stats:
-            if stats['total_decode_time'] > 0:
-                stats['eval_per_second'] = stats['eval_count'] / stats['total_decode_time']
-        
-        if 'prompt_eval_count' in stats and 'total_prompt_time' in stats:
-            if stats['total_prompt_time'] > 0:
-                stats['prompt_eval_per_second'] = stats['prompt_eval_count'] / stats['total_prompt_time']
-        
-        return stats
-    
-    def _map_metric(self, metric_name: str, value: float, stats: Dict):
-        """Map metric name to internal stats"""
-        # llamacpp: format (newer llama-server)
-        if metric_name == 'llamacpp:requests_processing':
-            stats['running_requests'] = int(value)
-        elif metric_name == 'llamacpp:predicted_tokens_seconds':
-            stats['tokens_per_second'] = value
-            stats['eval_per_second'] = value
-        elif metric_name == 'llamacpp:prompt_tokens_seconds':
-            stats['prompt_eval_per_second'] = value
-        elif metric_name == 'llamacpp:tokens_predicted_total':
-            stats['eval_count'] = int(value)
-        elif metric_name == 'llamacpp:prompt_tokens_total':
-            stats['prompt_eval_count'] = int(value)
-        elif metric_name == 'llamacpp:tokens_predicted_seconds_total':
-            stats['total_decode_time'] = value
-        elif metric_name == 'llamacpp:prompt_seconds_total':
-            stats['total_prompt_time'] = value
-        elif metric_name == 'llamacpp:n_busy_slots_per_decode':
-            stats['avg_busy_slots'] = value
-        
-        # llama_* format (older/different llama-server)
-        elif metric_name == 'llama_request_eval_count_sum':
-            stats['eval_count'] = int(value)
-        elif metric_name == 'llama_request_prompt_eval_count_sum':
-            stats['prompt_eval_count'] = int(value)
-        elif metric_name == 'llama_request_counter':
-            stats['total_requests'] = int(value)
-        elif metric_name == 'llama_processing_running':
-            stats['running_requests'] = int(value)
-        elif metric_name == 'llama_token_decode_seconds_sum':
-            stats['total_decode_time'] = value
-        elif metric_name == 'llama_token_prompt_eval_seconds_sum':
-            stats['total_prompt_time'] = value
-        elif metric_name == 'llama_context_hit_ratio':
-            stats['cache_hit_rate'] = value * 100
-        elif metric_name == 'llama_token_per_second_decode':
-            stats['tokens_per_second'] = value
-            stats['eval_per_second'] = value
-        elif metric_name == 'llama_token_per_second_prompt_eval':
-            stats['prompt_eval_per_second'] = value
-    
+        """Parse Prometheus metrics through the typed backend adapters."""
+        if not metrics_text.strip():
+            return {}
+        return parse_prometheus_metrics(metrics_text).to_stats()
+
     def _create_tasks_from_stats(self, stats: Dict) -> List[Dict[str, Any]]:
         """Create fake task list from stats"""
         tasks = []
-        running = stats.get('running_requests', 0)
-        
+        running = stats.get("running_requests", 0)
+
         if running > 0:
-            tps = stats.get('tokens_per_second', stats.get('eval_per_second', 0))
+            tps = stats.get("tokens_per_second", stats.get("eval_per_second", 0))
             for i in range(running):
-                tasks.append({
-                    'id': i + 1,
-                    'status': 'running',
-                    'stage': 'decode',
-                    'tokens_generated': stats.get('eval_count', 0) // max(running, 1),
-                    'tps': tps / max(running, 1)
-                })
-        
+                tasks.append(
+                    {
+                        "id": i + 1,
+                        "status": "running",
+                        "stage": "decode",
+                        "tokens_generated": stats.get("eval_count", 0) // max(running, 1),
+                        "tps": tps / max(running, 1),
+                    }
+                )
+
         return tasks
-    
+
+    def _append_waiting_tasks(self, tasks: List[Dict[str, Any]], waiting: Any) -> None:
+        """Add only the bounded queue sample that the terminal can display."""
+        try:
+            waiting_count = max(0, int(waiting))
+        except (TypeError, ValueError, OverflowError):
+            waiting_count = 0
+
+        available_rows = max(0, self.MAX_DISPLAY_TASK_ROWS - len(tasks))
+        displayed_count = min(waiting_count, available_rows)
+        if waiting_count > displayed_count:
+            if waiting_count != self._last_truncated_waiting:
+                self.logger.warning(
+                    "Queue telemetry reports %d waiting requests; displaying the first %d",
+                    waiting_count,
+                    displayed_count,
+                )
+            self._last_truncated_waiting = waiting_count
+        else:
+            self._last_truncated_waiting = None
+
+        for position in range(displayed_count):
+            tasks.append(
+                {
+                    "id": f"queue-{position + 1}",
+                    "status": "queued",
+                    "stage": "waiting",
+                    "queue_position": position + 1,
+                }
+            )
+
     def _detect_stage(self, task: Dict) -> str:
         """Detect task stage (prefill vs decode)"""
-        prompt_eval = task.get('prompt_eval_count', 0)
-        total_prompt = task.get('total_prompt_tokens', 0)
-        tokens_total = task.get('tokens_total', 0)
-        eval_count = task.get('eval_count', 0)
-        tokens_generated = task.get('tokens_generated', 0)
-        progress = task.get('progress', 0)
+        prompt_eval = task.get("prompt_eval_count", 0)
+        total_prompt = task.get("total_prompt_tokens", 0)
+        tokens_total = task.get("tokens_total", 0)
+        eval_count = task.get("eval_count", 0)
+        tokens_generated = task.get("tokens_generated", 0)
+        progress = task.get("progress", 0)
 
         # Use tokens_total as fallback for total_prompt
         if total_prompt <= 0:
@@ -1394,28 +1458,33 @@ class LLAMAServerClient:
 
         # Prefill stage: still processing prompt tokens
         if total_prompt > 0 and prompt_eval < total_prompt:
-            return 'prefill'
+            return "prefill"
         # Decode stage: has generated tokens or eval count
         elif eval_count > 0 or tokens_generated > 0 or progress > 0:
-            return 'decode'
+            return "decode"
         else:
-            return 'waiting'
-    
+            return "waiting"
+
     def get_tps_history(self, data: Dict) -> List[float]:
         """Extract TPS history for chart"""
         # Try to get historical data
-        if 'tokens_per_second_history' in data:
-            return data['tokens_per_second_history'][-30:]
-        elif 'eval_rate_history' in data:
-            return data['eval_rate_history'][-30:]
+        if "tokens_per_second_history" in data:
+            return data["tokens_per_second_history"][-30:]
+        elif "eval_rate_history" in data:
+            return data["eval_rate_history"][-30:]
         return []
-    
+
     def update_data(self):
         """Refresh data from server - probe endpoints"""
         self.probe_endpoints()
 
-    def get_fresh_stats(self, prev_prompt_count: int = 0, prev_eval_count: int = 0,
-                        prev_time: float = 0) -> Tuple[Dict[str, Any], int, int, float]:
+    def get_fresh_stats(
+        self,
+        prev_prompt_count: int = 0,
+        prev_eval_count: int = 0,
+        prev_time: float = 0,
+        metrics_text: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], int, int, float]:
         """Get fresh stats directly from /metrics endpoint.
         Returns (stats, current_prompt_count, current_eval_count, current_time)
         """
@@ -1425,115 +1494,130 @@ class LLAMAServerClient:
         current_time = time.time()
 
         try:
-            resp = self.session.get(f"{self.base_url}/metrics", timeout=0.5)
-            if resp.status_code == 200:
-                raw_stats = self._parse_prometheus_metrics(resp.text)
+            if metrics_text is None:
+                metrics_text = self.fetch_metrics_text()
+            if metrics_text is not None:
+                raw_stats = self._parse_prometheus_metrics(metrics_text)
                 if raw_stats:
-                    prompt_count = raw_stats.get('prompt_eval_count', 0)
-                    eval_count = raw_stats.get('eval_count', 0)
-                    running_requests = raw_stats.get('running_requests', 0)
+                    prompt_count = raw_stats.get("prompt_eval_count", 0)
+                    eval_count = raw_stats.get("eval_count", 0)
+                    running_requests = raw_stats.get("running_requests", 0)
 
                     current_prompt_count = prompt_count
                     current_eval_count = eval_count
 
                     # Calculate deltas for phase detection
                     time_delta = current_time - prev_time if prev_time > 0 else 0
-                    prompt_delta = prompt_count - prev_prompt_count if prev_prompt_count > 0 else 0
-                    eval_delta = eval_count - prev_eval_count if prev_eval_count > 0 else 0
+                    prompt_delta = (
+                        (prompt_count if prompt_count < prev_prompt_count else prompt_count - prev_prompt_count)
+                        if prev_prompt_count > 0
+                        else 0
+                    )
+                    eval_delta = (
+                        (eval_count if eval_count < prev_eval_count else eval_count - prev_eval_count)
+                        if prev_eval_count > 0
+                        else 0
+                    )
 
                     # Determine current phase
                     # prefill: prompt being processed, no eval tokens yet
                     # decode: eval tokens are being generated
-                    phase = 'waiting'
+                    phase = "waiting"
                     if running_requests > 0:
-                        if eval_count == 0:
-                            phase = 'prefill'
+                        if prompt_delta > 0 and eval_delta <= 0:
+                            phase = "prefill"
                         else:
-                            phase = 'decode'
+                            phase = "decode"
 
                     # If no running requests, TPS should be 0
                     if running_requests == 0:
-                        stats['tokens_per_second'] = 0
-                        stats['eval_per_second'] = 0
-                        stats['prompt_eval_per_second'] = 0
+                        stats["tokens_per_second"] = 0
+                        stats["eval_per_second"] = 0
+                        stats["prompt_eval_per_second"] = 0
                     else:
                         # Use server-reported rates as base
-                        server_tps = raw_stats.get('tokens_per_second', 0)
-                        server_prompt_tps = raw_stats.get('prompt_eval_per_second', 0)
+                        server_tps = raw_stats.get("tokens_per_second", 0)
+                        server_prompt_tps = raw_stats.get("prompt_eval_per_second", 0)
 
                         # If we detected new tokens, calculate instantaneous rate
                         if time_delta > 0:
                             if prompt_delta > 0:
-                                stats['prompt_eval_per_second'] = prompt_delta / time_delta
+                                stats["prompt_eval_per_second"] = prompt_delta / time_delta
                             else:
-                                stats['prompt_eval_per_second'] = server_prompt_tps
+                                stats["prompt_eval_per_second"] = server_prompt_tps
 
                             if eval_delta > 0:
-                                stats['tokens_per_second'] = eval_delta / time_delta
-                                stats['eval_per_second'] = eval_delta / time_delta
+                                stats["tokens_per_second"] = eval_delta / time_delta
+                                stats["eval_per_second"] = eval_delta / time_delta
                             else:
-                                stats['tokens_per_second'] = server_tps
-                                stats['eval_per_second'] = server_tps
+                                stats["tokens_per_second"] = server_tps
+                                stats["eval_per_second"] = server_tps
                         else:
                             # First call or no time delta, use server values
-                            stats['tokens_per_second'] = server_tps
-                            stats['eval_per_second'] = server_tps
-                            stats['prompt_eval_per_second'] = server_prompt_tps
+                            stats["tokens_per_second"] = server_tps
+                            stats["eval_per_second"] = server_tps
+                            stats["prompt_eval_per_second"] = server_prompt_tps
 
                     # Include other stats
-                    stats['running_requests'] = running_requests
-                    stats['cache_hit_rate'] = raw_stats.get('cache_hit_rate', 0)
-                    stats['prompt_eval_count'] = prompt_count
-                    stats['eval_count'] = eval_count
-                    stats['eval_delta'] = eval_delta
-                    stats['prompt_delta'] = prompt_delta
-                    stats['phase'] = phase
+                    stats["running_requests"] = running_requests
+                    stats["waiting_requests"] = raw_stats.get("waiting_requests", 0)
+                    stats["cache_hit_rate"] = raw_stats.get("cache_hit_rate", 0)
+                    stats["kv_cache_usage_percent"] = raw_stats.get("kv_cache_usage_percent", 0)
+                    stats["preemptions"] = raw_stats.get("preemptions", 0)
+                    stats["prompt_eval_count"] = prompt_count
+                    stats["eval_count"] = eval_count
+                    stats["eval_delta"] = eval_delta
+                    stats["prompt_delta"] = prompt_delta
+                    stats["phase"] = phase
 
-                    self.logger.debug(f"Stats: tps={stats['tokens_per_second']:.1f}, running={stats['running_requests']}, phase={phase}")
+                    self.logger.debug(
+                        f"Stats: tps={stats['tokens_per_second']:.1f}, "
+                        f"running={stats['running_requests']}, phase={phase}"
+                    )
         except Exception as e:
             self.logger.debug(f"Fresh stats query failed: {e}")
 
         return stats, current_prompt_count, current_eval_count, current_time
 
-    def get_slots(self) -> List[Dict[str, Any]]:
+    def get_slots(self, slots_data: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """Get slot information from /slots endpoint"""
         slots = []
         try:
-            resp = self.session.get(f"{self.base_url}/slots", timeout=0.5)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    for slot in data:
-                        # Only include slots with valid task IDs (not empty/idle slots)
-                        task_id = slot.get('id_task', -1)
-                        is_processing = slot.get('is_processing', False)
-
-                        slot_info = {
-                            'slot_id': slot.get('id', 0),
-                            'task_id': task_id,
-                            'is_processing': is_processing,
-                            'n_decoded': 0,
-                            'n_remain': 0,
-                            'prompt_count': 0,
-                            'tps': 0.0
-                        }
-                        # Get token info from next_token array
-                        next_token = slot.get('next_token', [])
-                        if isinstance(next_token, list) and len(next_token) > 0:
-                            slot_info['n_decoded'] = next_token[0].get('n_decoded', 0)
-                            slot_info['n_remain'] = next_token[0].get('n_remain', 0)
-                        # Get prompt tokens from common_token_ids
-                        if 'common_token_ids' in slot:
-                            slot_info['prompt_count'] = len(slot.get('common_token_ids', []))
-                        # Only add slots that are processing or have valid task
-                        if is_processing or task_id > 0:
-                            slots.append(slot_info)
-                self.logger.debug(f"Got slots: {len(slots)} active slots")
+            if slots_data is None:
+                resp = self._bounded_get(f"{self.base_url}/slots", timeout=0.5)
+                slots_data = resp.json() if resp.status_code == 200 else []
+            for slot in slots_data if isinstance(slots_data, list) else []:
+                task_id = slot.get("id_task", -1)
+                is_processing = slot.get("is_processing", False)
+                slot_info = {
+                    "slot_id": slot.get("id", 0),
+                    "task_id": task_id,
+                    "is_processing": is_processing,
+                    "n_decoded": 0,
+                    "n_remain": 0,
+                    "prompt_count": 0,
+                    "tps": 0.0,
+                }
+                next_token = slot.get("next_token", [])
+                if isinstance(next_token, list) and next_token:
+                    slot_info["n_decoded"] = next_token[0].get("n_decoded", 0)
+                    slot_info["n_remain"] = next_token[0].get("n_remain", 0)
+                if "common_token_ids" in slot:
+                    slot_info["prompt_count"] = len(slot.get("common_token_ids", []))
+                if is_processing or task_id > 0:
+                    slots.append(slot_info)
+            self.logger.debug(f"Got slots: {len(slots)} active slots")
         except Exception as e:
             self.logger.debug(f"Slots query failed: {e}")
         return slots
 
-    def get_fresh_tasks(self, prev_prompt_count: int = 0, prev_eval_count: int = 0) -> Tuple[List[Dict[str, Any]], int, int]:
+    def get_fresh_tasks(
+        self,
+        prev_prompt_count: int = 0,
+        prev_eval_count: int = 0,
+        metrics_text: Optional[str] = None,
+        slots_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
         """Get fresh tasks from /slots endpoint with per-task details.
         Returns (tasks, current_prompt_count, current_eval_count) for delta tracking.
         Tasks are organized as a tree structure grouped by task_id (job_id).
@@ -1543,42 +1627,46 @@ class LLAMAServerClient:
         current_eval_count = 0
 
         # First try to get real tasks from /slots endpoint
-        slots = self.get_slots()
+        slots = (
+            self.get_slots(slots_data)
+            if self.backend == BackendKind.LLAMA_CPP.value and "/slots" in self.available_endpoints
+            else []
+        )
 
         # Also query /metrics for stage detection (prefill vs decode)
         prompt_eval_count = 0
         eval_count = 0
         running_requests = 0
         try:
-            resp = self.session.get(f"{self.base_url}/metrics", timeout=0.5)
-            if resp.status_code == 200:
-                metrics = self._parse_prometheus_metrics(resp.text)
+            if metrics_text is None:
+                metrics_text = self.fetch_metrics_text()
+            if metrics_text is not None:
+                metrics = self._parse_prometheus_metrics(metrics_text)
                 if metrics:
-                    prompt_eval_count = metrics.get('prompt_eval_count', 0)
-                    eval_count = metrics.get('eval_count', 0)
-                    running_requests = metrics.get('running_requests', 0)
+                    prompt_eval_count = metrics.get("prompt_eval_count", 0)
+                    eval_count = metrics.get("eval_count", 0)
+                    running_requests = metrics.get("running_requests", 0)
         except Exception as e:
             self.logger.debug(f"Fresh tasks metrics query failed: {e}")
 
-
         # Determine global stage: prefill if prompt being processed but no output yet
-        global_stage = 'decode'
+        global_stage = "decode"
         if running_requests > 0 and eval_count == 0 and prompt_eval_count > 0:
-            global_stage = 'prefill'
+            global_stage = "prefill"
 
         if slots:
             # Only show slots that are actually processing (is_processing=True)
             # These are real-time active tasks, not completed slots
-            active_slots = [s for s in slots if s.get('is_processing')]
+            active_slots = [s for s in slots if s.get("is_processing")]
 
             for slot in active_slots:
-                n_decoded = slot.get('n_decoded', 0)
-                n_remain = slot.get('n_remain', 0)
-                prompt_count = slot.get('prompt_count', 0)
+                n_decoded = slot.get("n_decoded", 0)
+                n_remain = slot.get("n_remain", 0)
+                prompt_count = slot.get("prompt_count", 0)
 
                 # Detect stage: if n_decoded == 0, definitely prefill
                 if n_decoded == 0:
-                    stage = 'prefill'
+                    stage = "prefill"
                 else:
                     stage = global_stage
 
@@ -1590,81 +1678,97 @@ class LLAMAServerClient:
 
                 # TPS will be calculated after we get stats
                 task_info = {
-                    'id': slot.get('slot_id', 0),
-                    'task_id': slot.get('task_id', 0),
-                    'status': 'running',
-                    'stage': stage,
-                    'tokens_generated': n_decoded,
-                    'tokens_remain': n_remain,
-                    'prompt_tokens': prompt_count,
-                    'progress': progress,
-                    'tps': 0.0,
-                    'prompt_tps': 0.0
+                    "id": slot.get("slot_id", 0),
+                    "task_id": slot.get("task_id", 0),
+                    "status": "running",
+                    "stage": stage,
+                    "tokens_generated": n_decoded,
+                    "tokens_remain": n_remain,
+                    "prompt_tokens": prompt_count,
+                    "progress": progress,
+                    "tps": 0.0,
+                    "prompt_tps": 0.0,
                 }
                 tasks.append(task_info)
 
             # Sum up total tokens from slots for stats tracking
-            current_eval_count = sum(s.get('n_decoded', 0) for s in slots)
-            current_prompt_count = sum(s.get('prompt_count', 0) for s in slots)
+            current_eval_count = sum(s.get("n_decoded", 0) for s in slots)
+            current_prompt_count = sum(s.get("prompt_count", 0) for s in slots)
 
             self.logger.debug(f"Got {len(tasks)} tasks from slots, total decoded={current_eval_count}")
 
         # Fallback to /metrics if no slots data
         if not tasks:
             try:
-                resp = self.session.get(f"{self.base_url}/metrics", timeout=0.5)
-                if resp.status_code == 200:
-                    stats = self._parse_prometheus_metrics(resp.text)
+                if metrics_text is not None:
+                    stats = self._parse_prometheus_metrics(metrics_text)
                     if stats:
-                        running = stats.get('running_requests', 0)
-                        tps = stats.get('tokens_per_second', 0)
-                        prompt_tps = stats.get('prompt_eval_per_second', 0)
-                        eval_count = stats.get('eval_count', 0)
-                        prompt_count = stats.get('prompt_eval_count', 0)
+                        running = stats.get("running_requests", 0)
+                        tps = stats.get("tokens_per_second", 0)
+                        prompt_tps = stats.get("prompt_eval_per_second", 0)
+                        eval_count = stats.get("eval_count", 0)
+                        prompt_count = stats.get("prompt_eval_count", 0)
 
                         current_prompt_count = prompt_count
                         current_eval_count = eval_count
 
                         # Calculate deltas to detect actual current phase
-                        prompt_delta = prompt_count - prev_prompt_count if prev_prompt_count > 0 else 0
-                        eval_delta = eval_count - prev_eval_count if prev_eval_count > 0 else 0
+                        prompt_delta = (
+                            (prompt_count if prompt_count < prev_prompt_count else prompt_count - prev_prompt_count)
+                            if prev_prompt_count > 0
+                            else 0
+                        )
+                        eval_delta = (
+                            (eval_count if eval_count < prev_eval_count else eval_count - prev_eval_count)
+                            if prev_eval_count > 0
+                            else 0
+                        )
 
-                        self.logger.debug(f"Stage: running={running}, prompt_delta={prompt_delta}, eval_delta={eval_delta}")
+                        self.logger.debug(
+                            f"Stage: running={running}, prompt_delta={prompt_delta}, eval_delta={eval_delta}"
+                        )
 
-                        # Determine stage: prefill if prompt still being processed, decode if generating tokens
+                        # Aggregate vLLM counters are lifetime totals, so stage
+                        # detection must use the current refresh delta.
                         if running > 0:
-                            # prefill: prompt being processed, no eval tokens yet
-                            # decode: eval tokens are being generated
-                            if eval_count == 0:
-                                stage = 'prefill'
+                            if prompt_delta > 0 and eval_delta <= 0:
+                                stage = "prefill"
                             else:
-                                stage = 'decode'
+                                stage = "decode"
 
                             task_info = {
-                                'id': 1,
-                                'status': 'running',
-                                'stage': stage,
-                                'tokens_generated': eval_count,
-                                'tokens_delta': eval_delta,
-                                'prompt_tokens': prompt_count,
-                                'prompt_delta': prompt_delta,
-                                'tps': tps,
-                                'prompt_tps': prompt_tps
+                                "id": 1,
+                                "status": "running",
+                                "stage": stage,
+                                "tokens_generated": eval_count,
+                                "tokens_delta": eval_delta,
+                                "prompt_tokens": prompt_count,
+                                "prompt_delta": prompt_delta,
+                                "tps": tps,
+                                "prompt_tps": prompt_tps,
                             }
                             tasks.append(task_info)
+                            self._append_waiting_tasks(tasks, stats.get("waiting_requests", 0))
+                        elif stats.get("waiting_requests", 0) > 0:
+                            self._append_waiting_tasks(tasks, stats["waiting_requests"])
                         elif tps > 0 or eval_delta > 0:
                             # Request just completed, show completion
-                            tasks.append({
-                                'id': 1,
-                                'status': 'completed',
-                                'stage': '-',
-                                'tokens_generated': eval_count,
-                                'prompt_tokens': prompt_count,
-                                'tps': tps,
-                                'prompt_tps': 0
-                            })
+                            tasks.append(
+                                {
+                                    "id": 1,
+                                    "status": "completed",
+                                    "stage": "-",
+                                    "tokens_generated": eval_count,
+                                    "prompt_tokens": prompt_count,
+                                    "tps": tps,
+                                    "prompt_tps": 0,
+                                }
+                            )
 
-                        self.logger.debug(f"Got fresh tasks from metrics: {len(tasks)} tasks, stage={tasks[0].get('stage') if tasks else 'none'}")
+                        self.logger.debug(
+                            f"Got fresh tasks from metrics: {len(tasks)} tasks, "
+                            f"stage={tasks[0].get('stage') if tasks else 'none'}"
+                        )
             except Exception as e:
                 self.logger.debug(f"Fresh tasks query failed: {e}")
 
@@ -1679,9 +1783,10 @@ class LLAMAServerClient:
 # TUI Interface (curses-based)
 # ============================================================================
 
+
 class TTUInterface:
     """Terminal User Interface using curses"""
-    
+
     # Color pairs
     COLOR_HEADER = 1
     COLOR_CPU = 2
@@ -1700,17 +1805,22 @@ class TTUInterface:
     COLOR_TPS_HIGH = 15
     COLOR_TPS_MED = 16
     COLOR_TPS_LOW = 17
-    
-    def __init__(self, stdscr, i18n: I18n, log_manager: LogManager):
+
+    def __init__(self, stdscr, i18n: I18n, log_manager: LogManager, system_scope: str = SystemScope.LOCAL.value):
         self.stdscr = stdscr
         self.i18n = i18n
         self.log_manager = log_manager
-        self.logger = logging.getLogger('llama_monitor')
+        self.logger = logging.getLogger("llama_monitor")
 
         self.running = True
         self.detail_mode = True
         self.last_update = None
-        self.server_url = ''
+        self.last_attempt = None
+        self.scrape_duration = 0.0
+        self.scrape_error = None
+        self.server_url = ""
+        self.backend = "connecting"
+        self.system_scope = system_scope
         self.refresh_interval = 1.0  # Default 1000ms
 
         # Data containers
@@ -1739,6 +1849,9 @@ class TTUInterface:
         # Endpoint refresh counter
         self.endpoint_refresh_counter = 0
         self.endpoint_refresh_interval = 30  # Re-probe endpoints every 30 refresh cycles
+        self._has_probed_endpoints = False
+        self._next_endpoint_probe = 0.0
+        self._endpoint_probe_backoff = 1.0
 
         # Previous metrics for delta calculation
         self._prev_prompt_count = 0
@@ -1750,312 +1863,254 @@ class TTUInterface:
 
         # Phase 2: Stage icons for status display
         self.STAGE_ICONS = {
-            'prefill':  '▶',
-            'decode':   '●',
-            'waiting':  '○',
-            'queued':   '○',
-            'running':  '●',
-            'completed':'✓',
-            'failed':   '✗',
+            "prefill": "▶",
+            "decode": "●",
+            "waiting": "○",
+            "queued": "○",
+            "running": "●",
+            "completed": "✓",
+            "failed": "✗",
         }
 
         # Phase 2: Pulse animation flag
         self._pulse_active = False
+        self._needs_redraw = True
+        self._manual_refresh = False
 
-        # UI style: 'default' or 'btop'
-        self.ui_style = os.environ.get('LLAMA_MONITOR_UI', 'default')
+        # The btop-inspired view is the default; the previous layout remains
+        # available with U for users who prefer it.
+        requested_style = os.environ.get("LLAMA_MONITOR_UI", os.environ.get("UI_STYLE", "btop")).lower()
+        self.ui_style = requested_style if requested_style in {"default", "btop"} else "btop"
 
         # Initialize curses
         self._init_curses()
-    
+
     def _draw_mini_graph(self, values: List[float], width: int = 20) -> str:
         """Draw a mini line graph using block characters.
         Similar to btop's mini graphs.
         """
         if not values:
-            return ' ' * width
+            return " " * width
         data = list(values)[-width:]
         if len(data) < 2:
-            return ' ' * width
+            return " " * width
         max_val = max(data) if max(data) > 0 else 1
-        bars = ''
+        bars = ""
         for v in data:
             ratio = v / max_val
             if ratio > 0.75:
-                bars += '█'
+                bars += "█"
             elif ratio > 0.5:
-                bars += '▄'
+                bars += "▄"
             elif ratio > 0.25:
-                bars += '▀'
+                bars += "▀"
             else:
-                bars += '░'
+                bars += "░"
         return bars
 
     def _draw_btop_ui(self):
-        """Draw btop-style TUI layout - Floating Modular Dashboard.
+        """Render a dense, colourful btop-like dashboard that adapts to the terminal."""
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        CP, DIM, BOLD = curses.color_pair, curses.A_DIM, curses.A_BOLD
 
-        Each module floats in its own space with visual air between sections.
-        No box-drawing chars - uses colored headers and whitespace for separation.
-        """
-        try:
-            height, width = self.stdscr.getmaxyx()
-            self.stdscr.erase()
-
-            CP = curses.color_pair
-            C_DIM = curses.A_DIM
-            C_BOLD = curses.A_BOLD
-
-            # Color palette - soft, readable colors with good contrast
-            C_TITLE = CP(1) | C_BOLD
-            C_HEADER_CPU = CP(2) | C_BOLD     # Green header
-            C_HEADER_GPU = CP(20) | C_BOLD    # Magenta header
-            C_HEADER_MEM = CP(19) | C_BOLD    # Cyan header
-            C_HEADER_PERF = CP(21) | C_BOLD   # Yellow header
-            C_HEADER_TASK = CP(13) | C_BOLD   # Yellow header
-            C_LABEL = CP(1) | C_DIM           # Dim white for labels
-            C_VALUE = CP(1)                   # Plain white for values
-
-            def color_for(percent: float):
-                """Get color based on usage percentage - soft ramp."""
-                if percent < 60:
-                    return CP(2)   # Green
-                elif percent < 85:
-                    return CP(11)  # Yellow (brighter)
-                else:
-                    return CP(9)   # Red (brighter)
-
-            def mod_header(label: str, y: int, x: int, color) -> int:
-                """Draw a floating module header. Returns next y position."""
-                header = f'  ██ {label} ██  '
+        def put(y: int, x: int, text: str, attr: int = 0) -> None:
+            if 0 <= y < height and 0 <= x < width - 1:
                 try:
-                    self.stdscr.addstr(y, x, header, color)
+                    self.stdscr.addnstr(y, x, text, width - x - 1, attr)
                 except curses.error:
                     pass
-                return y + 1
 
-            def bar_row(label: str, value_str: str, pct: float,
-                        y: int, x: int, bar_width: int = 12) -> int:
-                """Draw a labeled bar row. Returns next y."""
-                try:
-                    self.stdscr.addstr(y, x, f'  {label}', C_LABEL)
-                except curses.error:
-                    pass
-                filled = min(int(pct / 100 * bar_width), bar_width)
-                bar = '█' * filled + '░' * (bar_width - filled)
-                bar_color = color_for(pct)
-                try:
-                    self.stdscr.addstr(y, x + 10, f'{bar} ', bar_color)
-                    self.stdscr.addstr(y, x + 10 + bar_width + 1, value_str, C_VALUE)
-                except curses.error:
-                    pass
-                return y + 1
+        def severity(value: float) -> int:
+            return CP(self.COLOR_SUCCESS if value < 65 else self.COLOR_WARNING if value < 85 else self.COLOR_ERROR)
 
-            def kv_row(label: str, value_str: str, y: int, x: int) -> int:
-                """Draw a label: value row. Returns next y."""
-                try:
-                    self.stdscr.addstr(y, x, f'  {label:<8}', C_LABEL)
-                    self.stdscr.addstr(y, x + 10, value_str, C_VALUE)
-                except curses.error:
-                    pass
-                return y + 1
+        def bar(value: float, cells: int) -> str:
+            filled = max(0, min(cells, round(value / 100 * cells)))
+            return "█" * filled + "░" * (cells - filled)
 
-            # ════════════════════════════════════════════════════════════
-            # TITLE BAR
-            # ════════════════════════════════════════════════════════════
-            hostname = socket.gethostname()
-            uptime_seconds = time.time() - psutil.boot_time()
-            uptime_str = self._format_uptime(uptime_seconds)
-            model_name = (self.model_info.get('name', '') if self.model_info else '')[:35]
-            title = f'  ● {self.i18n.get("title")}  │  uptime: {uptime_str}'
-            if model_name:
-                title += f'  │  {model_name}'
-            try:
-                self.stdscr.addstr(0, 0, title[:width-1], C_TITLE)
-                ts = self.last_update.strftime('%H:%M:%S') if self.last_update else '--:--:--'
-                self.stdscr.addstr(0, max(0, width - len(ts) - 2), f'  {ts}', C_DIM)
-            except curses.error:
-                pass
+        def spark(values: List[float], cells: int) -> str:
+            if cells <= 0:
+                return ""
+            values = values[-cells:]
+            if not values:
+                return "·" * cells
+            ceiling = max(max(values), 1)
+            glyphs = "▁▂▃▄▅▆▇█"
+            return "".join(glyphs[min(7, int(value / ceiling * 7))] for value in values).rjust(cells, "·")
 
-            # ════════════════════════════════════════════════════════════
-            # LAYOUT: Two-column grid with floating modules
-            # Left col: CPU, MEM  |  Right col: GPU, PERF
-            # Bottom: TASKS (full width)
-            # ════════════════════════════════════════════════════════════
-            mid_x = max(2, width // 2 - 1)
-            content_width = mid_x - 2
+        def panel(y: int, x: int, panel_width: int, panel_height: int, title: str, color: int) -> None:
+            if panel_width < 8 or panel_height < 3:
+                return
+            put(y, x, "╭" + "─" * (panel_width - 2) + "╮", color | DIM)
+            put(y + panel_height - 1, x, "╰" + "─" * (panel_width - 2) + "╯", color | DIM)
+            for row in range(y + 1, y + panel_height - 1):
+                put(row, x, "│", color | DIM)
+                put(row, x + panel_width - 1, "│", color | DIM)
+            put(y, x + 2, f" {title} ", color | BOLD)
 
-            y = 2
-
-            # ── ROW 1: CPU + GPU (side by side) ────────────────────────
-            y = mod_header('CPU', y, 0, C_HEADER_CPU)
-            cpu = self.cpu_info or {}
-            cpu_usage = cpu.get('usage', 0)
-            cpu_freq = cpu.get('frequency', 0) / 1000
-            cpu_cores = cpu.get('cores', 0)
-            cpu_threads = cpu.get('threads', 0)
-
-            y = bar_row('Usage', f'{cpu_usage:5.1f}%', cpu_usage, y, 0)
-            freq_str = f'{cpu_freq:.2f}GHz' if cpu_freq > 0 else 'N/A'
-            y = kv_row('Freq', freq_str, y, 0)
-            y = kv_row('Cores', f'{cpu_cores}c/{cpu_threads}t', y, 0)
-
-            # CPU sparkline
-            cpu_hist = list(self.cpu_usage_history)
-            spark = self._draw_mini_graph(list(cpu_hist), width=min(24, content_width - 4))
-            try:
-                self.stdscr.addstr(y, 2, f'  ▁▂▃▅▇ {spark}', CP(2) | C_DIM)
-            except curses.error:
-                pass
-            y += 1
-
-            y += 1  # Gap between modules
-
-            # GPU module (right column, aligned with CPU)
-            gpu_y = 3
-            gpu = self.gpu_info[0] if self.gpu_info else {}
-            gpu_usage = gpu.get('utilization', 0)
-            gpu_mem_used = gpu.get('memory_used', 0) / 1024
-            gpu_mem_total = gpu.get('memory_total', 0) / 1024
-            gpu_temp = gpu.get('temperature', 0)
-            gpu_power = gpu.get('power', 0)
-
-            gpu_y = mod_header('GPU', gpu_y, mid_x, C_HEADER_GPU)
-            gpu_y = bar_row('Usage', f'{gpu_usage:5.1f}%', gpu_usage, gpu_y, mid_x)
-            gpu_y = kv_row('Mem', f'{gpu_mem_used:.1f}/{gpu_mem_total:.1f}GB', gpu_y, mid_x)
-            if gpu_temp > 0:
-                gpu_y = kv_row('Temp', f'{gpu_temp}°C', gpu_y, mid_x)
-            if gpu_power > 0:
-                gpu_y = kv_row('Power', f'{gpu_power:.0f}W', gpu_y, mid_x)
-
-            # GPU sparkline (aligned with CPU sparkline row)
-            gpu_hist = list(getattr(self, 'gpu_usage_history', []))
-            gpu_spark = self._draw_mini_graph(list(gpu_hist), width=min(24, content_width - 4)) if gpu_hist else '─' * min(24, content_width - 4)
-            try:
-                self.stdscr.addstr(8, mid_x + 2, f'  ▁▂▃▅▇ {gpu_spark}', CP(20) | C_DIM)
-            except curses.error:
-                pass
-
-            y += 2  # Gap before next row
-
-            # ── ROW 2: MEM + PERF (side by side) ──────────────────────
-            y = mod_header('MEM', y, 0, C_HEADER_MEM)
-            mem = self.memory_info or {}
-            mem_usage = mem.get('percent', 0)
-            mem_used = mem.get('used', 0)
-            mem_total = mem.get('total', 0)
-
-            y = bar_row('Used', f'{mem_usage:5.1f}%', mem_usage, y, 0)
-            y = kv_row('Size', f'{mem_used:.1f}/{mem_total:.1f}GB', y, 0)
-
-            y += 1  # Gap
-
-            # PERF module (right col, aligned with MEM start)
-            perf_y = y - 4
-            stats = self.stats or {}
-            tps = stats.get('tokens_per_second', 0)
-            cache_hit = stats.get('cache_hit_rate', 0)
-            running = stats.get('running_requests', 0)
-
-            perf_y = mod_header('PERF', perf_y, mid_x, C_HEADER_PERF)
-
-            tps_max = max(max(self.tps_history), 50) if self.tps_history else 50
-            tps_bar_width = 12
-            tps_filled = min(int(tps / tps_max * tps_bar_width), tps_bar_width)
-            tps_bar = '█' * tps_filled + '░' * (tps_bar_width - tps_filled)
-            tps_color = CP(2) if tps > 40 else (CP(11) if tps > 20 else CP(9))
-
-            try:
-                self.stdscr.addstr(perf_y, mid_x + 2, '  TPS   ')
-                self.stdscr.addstr(perf_y, mid_x + 10, f'{tps_bar} {tps:5.1f}', tps_color)
-            except curses.error:
-                pass
-            perf_y += 1
-
-            cache_str = f'{cache_hit:.0f}%' if cache_hit > 0 else 'N/A'
-            perf_y = kv_row('Cache', cache_str, perf_y, mid_x)
-            perf_y = kv_row('Run', str(running), perf_y, mid_x)
-
-            # TPS sparkline
-            tps_spark = self._draw_mini_graph(list(self.tps_history), width=min(24, content_width - 4))
-            try:
-                self.stdscr.addstr(perf_y, mid_x + 2, f'  ▁▂▃▅▇ {tps_spark}', CP(21) | C_DIM)
-            except curses.error:
-                pass
-
-            y += 2  # Gap before tasks
-
-            # ── ROW 3: TASKS (full width) ─────────────────────────────
-            y = mod_header('TASKS', y, 0, C_HEADER_TASK)
-
-            active_tasks = [t for t in self.tasks if t.get('status') == 'running']
-            queued_count = len([t for t in self.tasks if t.get('status') == 'queued'])
-
-            if active_tasks:
-                task = active_tasks[0]
-                stage = task.get('stage', 'decode')
-                progress = task.get('progress', 0)
-                tokens_gen = task.get('tokens_generated', 0)
-
-                stage_color = CP(19) if stage == 'prefill' else CP(20)
-                stage_str = self.i18n.get(stage).upper() if stage in ['prefill', 'decode', 'waiting'] else stage.upper()
-
-                prog_bar_width = 20
-                prog_bar_filled = int(progress / 100 * prog_bar_width)
-                prog_bar = '█' * prog_bar_filled + '░' * (prog_bar_width - prog_bar_filled)
-
-                try:
-                    self.stdscr.addstr(y, 2, f'  ● {stage_str}  [{prog_bar}]  {progress:3d}%', stage_color)
-                    if tokens_gen > 0:
-                        self.stdscr.addstr(y, 55, f'  out: {tokens_gen:,}', C_LABEL)
-                except curses.error:
-                    pass
-                y += 1
-
-                if queued_count > 0:
-                    suffix = 's' if queued_count > 1 else ''
-                    try:
-                        self.stdscr.addstr(y, 2, f'  ○ Queued: {queued_count} task{suffix} waiting', C_LABEL)
-                    except curses.error:
-                        pass
-                    y += 1
-            else:
-                try:
-                    self.stdscr.addstr(y, 2, '  ●  No active tasks', C_LABEL)
-                except curses.error:
-                    pass
-                y += 1
-
-                if queued_count > 0:
-                    suffix = 's' if queued_count > 1 else ''
-                    try:
-                        self.stdscr.addstr(y, 2, f'  ○ Queued: {queued_count} task{suffix} waiting', C_LABEL)
-                    except curses.error:
-                        pass
-                    y += 1
-
-            # ── FOOTER ─────────────────────────────────────────────────
-            footer_y = height - 1
-            shortcuts = '  Q=quit  +=slower  -=faster  R=refresh  M=language'
-            rate_str = f'Rate: {self.refresh_interval*1000:.0f}ms'
-            footer = shortcuts + ' ' * max(0, width - len(shortcuts) - len(rate_str) - 3) + rate_str
-            try:
-                self.stdscr.addstr(footer_y, 0, footer[:width-1], C_LABEL)
-            except curses.error:
-                pass
-
+        if width < 74 or height < 24:
+            put(0, 0, "Terminal too small — resize to at least 74×24", CP(self.COLOR_WARNING) | BOLD)
             self.stdscr.refresh()
+            return
 
-        except curses.error as e:
-            self.logger.debug(f"btop UI draw error: {e}")
+        now = self.last_update.strftime("%H:%M:%S") if self.last_update else "--:--:--"
+        model = display_model_name(self.model_info.get("name")) if self.model_info else "waiting for server"
+        backend = getattr(self, "backend", "connecting")
+        stale_after = max(5.0, self.refresh_interval * 3)
+        snapshot_age = (
+            (datetime.now() - self.last_successful_api).total_seconds() if self.last_successful_api else float("inf")
+        )
+        snapshot_fresh = snapshot_age <= stale_after
+        status_color = CP(self.COLOR_SUCCESS if snapshot_fresh else self.COLOR_WARNING)
+        header = f" ◆ {backend.upper()} MONITOR  ·  {socket.gethostname()}  ·  {model}"
+        put(0, 1, header, CP(self.COLOR_HEADER) | BOLD)
+        put(0, width - len(now) - 3, f"◷ {now}", status_color | BOLD)
+        scope_text = (
+            "local host + inference telemetry"
+            if self.system_scope == SystemScope.LOCAL.value
+            else "remote API telemetry · local host metrics disabled"
+        )
+        put(1, 1, f"btop view  •  {scope_text}", CP(self.COLOR_HEADER) | DIM)
+
+        gap, left_x, content_y = 2, 1, 3
+        left_width = (width - gap - 2) // 2
+        right_x = left_x + left_width + gap
+        right_width = width - right_x - 1
+        top_height = max(7, min(10, (height - content_y - 8) // 2))
+        middle_y = content_y + top_height + 1
+        middle_height = max(5, height - middle_y - 7)
+        tasks_y = middle_y + middle_height + 1
+        tasks_height = height - tasks_y - 2
+
+        # CPU
+        panel(content_y, left_x, left_width, top_height, "CPU", CP(self.COLOR_CPU))
+        cpu = self.cpu_info or {}
+        usage = float(cpu.get("usage", 0) or 0)
+        cpu_cells = max(8, left_width - 23)
+        put(content_y + 2, left_x + 2, "usage", CP(self.COLOR_HEADER) | DIM)
+        put(content_y + 2, left_x + 10, bar(usage, cpu_cells), severity(usage) | BOLD)
+        put(content_y + 2, left_x + 11 + cpu_cells, f"{usage:5.1f}%", severity(usage) | BOLD)
+        freq = float(cpu.get("frequency", 0) or 0) / 1000
+        put(
+            content_y + 3,
+            left_x + 2,
+            f"{cpu.get('cores', 0)} cores / {cpu.get('threads', 0)} threads",
+            CP(self.COLOR_HEADER) | DIM,
+        )
+        put(content_y + 3, left_x + left_width - 12, f"{freq:.2f} GHz", CP(self.COLOR_CPU))
+        put(content_y + 5, left_x + 2, spark(list(self.cpu_usage_history), left_width - 4), CP(self.COLOR_CPU))
+        if self.system_scope == SystemScope.OFF.value:
+            for row in range(content_y + 2, content_y + top_height - 1):
+                put(row, left_x + 1, " " * (left_width - 2))
+            put(content_y + 3, left_x + 3, "LOCAL METRICS OFF FOR REMOTE TARGET", CP(self.COLOR_WARNING) | BOLD)
+
+        # GPU, retaining per-device visibility rather than only the first GPU.
+        panel(content_y, right_x, right_width, top_height, "GPU", CP(self.COLOR_GPU))
+        if not self.gpu_info:
+            put(content_y + 3, right_x + 2, "No GPU telemetry available", CP(self.COLOR_WARNING) | DIM)
+        for index, gpu in enumerate(self.gpu_info[: max(1, top_height - 4)]):
+            row = content_y + 2 + index
+            gpu_usage = float(gpu.get("utilization", 0) or 0)
+            memory_total = float(gpu.get("memory_total", 0) or 0)
+            memory_used = float(gpu.get("memory_used", 0) or 0)
+            memory_percent = memory_used / memory_total * 100 if memory_total else 0
+            name = str(gpu.get("name", f"GPU {index}"))[:14]
+            gpu_cells = max(5, right_width - 34)
+            put(row, right_x + 2, f"{index}:{name:<14}", CP(self.COLOR_HEADER) | DIM)
+            put(row, right_x + 18, bar(gpu_usage, gpu_cells), severity(gpu_usage))
+            put(
+                row,
+                right_x + 19 + gpu_cells,
+                f"{gpu_usage:3.0f}% {memory_percent:3.0f}% {gpu.get('temperature', 0):2.0f}°",
+                severity(max(gpu_usage, memory_percent)) | BOLD,
+            )
+        if len(self.gpu_info) > max(1, top_height - 4):
+            put(
+                content_y + top_height - 2,
+                right_x + 2,
+                f"+ {len(self.gpu_info) - max(1, top_height - 4)} more devices",
+                CP(self.COLOR_GPU) | DIM,
+            )
+
+        # Memory
+        panel(middle_y, left_x, left_width, middle_height, "MEMORY", CP(19))
+        mem = self.memory_info or {}
+        mem_percent = float(mem.get("percent", 0) or 0)
+        mem_cells = max(8, left_width - 23)
+        put(middle_y + 2, left_x + 2, "memory", CP(self.COLOR_HEADER) | DIM)
+        put(middle_y + 2, left_x + 10, bar(mem_percent, mem_cells), severity(mem_percent) | BOLD)
+        put(middle_y + 2, left_x + 11 + mem_cells, f"{mem_percent:5.1f}%", severity(mem_percent) | BOLD)
+        put(middle_y + 3, left_x + 2, f"{mem.get('used', 0):.1f} / {mem.get('total', 0):.1f} GiB", CP(19))
+        put(middle_y + 4, left_x + 2, spark(list(self.memory_usage_history), left_width - 4), CP(19))
+        if self.system_scope == SystemScope.OFF.value:
+            for row in range(middle_y + 2, middle_y + middle_height - 1):
+                put(row, left_x + 1, " " * (left_width - 2))
+            put(middle_y + 3, left_x + 3, "use --system local to enable", CP(self.COLOR_HEADER) | DIM)
+
+        # Inference performance
+        panel(middle_y, right_x, right_width, middle_height, "INFERENCE", CP(self.COLOR_METRICS))
+        stats = self.stats or {}
+        tps = float(stats.get("tokens_per_second", 0) or 0)
+        cache = stats.get("cache_hit_rate", 0)
+        active = stats.get("running_requests", len([task for task in self.tasks if task.get("status") == "running"]))
+        waiting = stats.get("waiting_requests", 0)
+        cache_text = f"KV {stats.get('kv_cache_usage_percent', 0):.0f}%" if backend == "vllm" else f"cache {cache:.0f}%"
+        tps_ceiling = max(50.0, max(self.tps_history, default=0.0))
+        tps_percent = min(100.0, tps / tps_ceiling * 100)
+        perf_cells = max(7, right_width - 24)
+        put(middle_y + 2, right_x + 2, "tok/s", CP(self.COLOR_HEADER) | DIM)
+        put(middle_y + 2, right_x + 9, bar(tps_percent, perf_cells), CP(self.COLOR_SUCCESS) | BOLD)
+        put(middle_y + 2, right_x + 10 + perf_cells, f"{tps:5.1f}", CP(self.COLOR_SUCCESS) | BOLD)
+        put(middle_y + 3, right_x + 2, f"active {active}  queued {waiting}  {cache_text}", CP(self.COLOR_HEADER) | DIM)
+        put(middle_y + 4, right_x + 2, spark(list(self.tps_history), right_width - 4), CP(self.COLOR_METRICS))
+
+        # Task strip
+        panel(tasks_y, 1, width - 2, tasks_height, "ACTIVE SLOTS", CP(self.COLOR_TASK))
+        running = [task for task in self.tasks if task.get("status") == "running"]
+        queued = len([task for task in self.tasks if task.get("status") == "queued"])
+        if running:
+            task = running[0]
+            stage = str(task.get("stage", "decode")).upper()
+            progress = max(0.0, min(100.0, float(task.get("progress", 0) or 0)))
+            task_cells = max(12, width - 49)
+            put(
+                tasks_y + 2,
+                3,
+                f"● {stage:<8}",
+                CP(self.COLOR_DECODE if stage == "DECODE" else self.COLOR_PREFILL) | BOLD,
+            )
+            put(tasks_y + 2, 14, bar(progress, task_cells), CP(self.COLOR_TASK))
+            put(
+                tasks_y + 2,
+                15 + task_cells,
+                f"{progress:5.1f}%  {task.get('tps', 0):.1f} tok/s",
+                CP(self.COLOR_HEADER) | BOLD,
+            )
+        else:
+            put(tasks_y + 2, 3, "○ idle — no active inference slots", CP(self.COLOR_HEADER) | DIM)
+        if queued and tasks_height > 4:
+            put(tasks_y + 3, 3, f"○ {queued} task(s) waiting in queue", CP(self.COLOR_QUEUED) | DIM)
+
+        footer = "Q quit  R refresh  +/- rate  M language  U classic/btop"
+        put(height - 1, 1, footer, CP(self.COLOR_HEADER) | DIM)
+        scrape_text = (
+            f"{self.scrape_duration * 1000:.0f}ms ●"
+            if snapshot_fresh
+            else f"stale {snapshot_age:.0f}s !"
+            if self.last_successful_api
+            else "waiting !"
+        )
+        put(height - 1, width - len(scrape_text) - 2, scrape_text, status_color | BOLD)
+        self.stdscr.refresh()
 
     def _format_uptime(self, seconds: float) -> str:
         """Format uptime seconds to human readable string."""
         hours = int(seconds // 3600)
         mins = int((seconds % 3600) // 60)
         if hours > 0:
-            return f'{hours}h {mins}m'
+            return f"{hours}h {mins}m"
         else:
-            return f'{mins}m'
+            return f"{mins}m"
 
     def _init_curses(self):
         """Initialize curses settings and colors - btop style"""
@@ -2084,34 +2139,40 @@ class TTUInterface:
                 try:
                     # Basic colors - unified scheme
                     curses.init_pair(self.COLOR_HEADER, curses.COLOR_WHITE, -1)
-                    curses.init_pair(self.COLOR_CPU, curses.COLOR_GREEN, -1)      # Green for CPU
-                    curses.init_pair(self.COLOR_GPU, curses.COLOR_CYAN, -1)      # Cyan for GPU
-                    curses.init_pair(self.COLOR_MODEL, curses.COLOR_MAGENTA, -1) # Magenta for Model
-                    curses.init_pair(self.COLOR_METRICS, curses.COLOR_YELLOW, -1) # Yellow for Metrics
+                    curses.init_pair(self.COLOR_CPU, curses.COLOR_GREEN, -1)  # Green for CPU
+                    curses.init_pair(self.COLOR_GPU, curses.COLOR_CYAN, -1)  # Cyan for GPU
+                    curses.init_pair(self.COLOR_MODEL, curses.COLOR_MAGENTA, -1)  # Magenta for Model
+                    curses.init_pair(self.COLOR_METRICS, curses.COLOR_YELLOW, -1)  # Yellow for Metrics
                     curses.init_pair(self.COLOR_TASK, curses.COLOR_MAGENTA, -1)  # Magenta for Tasks
 
                     curses.init_pair(self.COLOR_BAR_FILLED, curses.COLOR_GREEN, -1)
                     curses.init_pair(self.COLOR_BAR_EMPTY, curses.COLOR_BLACK, -1)
 
                     # Status colors
-                    curses.init_pair(self.COLOR_PREFILL, curses.COLOR_CYAN, -1)    # Cyan for prefill
+                    curses.init_pair(self.COLOR_PREFILL, curses.COLOR_CYAN, -1)  # Cyan for prefill
                     curses.init_pair(self.COLOR_DECODE, curses.COLOR_MAGENTA, -1)  # Magenta for decode
-                    curses.init_pair(self.COLOR_QUEUED, curses.COLOR_WHITE, -1)    # White for queued
+                    curses.init_pair(self.COLOR_QUEUED, curses.COLOR_WHITE, -1)  # White for queued
 
                     # Usage level colors (unified across panels)
-                    curses.init_pair(self.COLOR_SUCCESS, curses.COLOR_GREEN, -1)   # Low/normal - green
-                    curses.init_pair(self.COLOR_WARNING, curses.COLOR_YELLOW, -1) # Medium - yellow
-                    curses.init_pair(self.COLOR_ERROR, curses.COLOR_RED, -1)     # High - red
+                    curses.init_pair(self.COLOR_SUCCESS, curses.COLOR_GREEN, -1)  # Low/normal - green
+                    curses.init_pair(self.COLOR_WARNING, curses.COLOR_YELLOW, -1)  # Medium - yellow
+                    curses.init_pair(self.COLOR_ERROR, curses.COLOR_RED, -1)  # High - red
 
                     # TPS colors
-                    curses.init_pair(self.COLOR_TPS_HIGH, curses.COLOR_GREEN, -1)   # >40 t/s - green
-                    curses.init_pair(self.COLOR_TPS_MED, curses.COLOR_YELLOW, -1)    # 20-40 t/s - yellow
-                    curses.init_pair(self.COLOR_TPS_LOW, curses.COLOR_RED, -1)      # <20 t/s - red
+                    curses.init_pair(self.COLOR_TPS_HIGH, curses.COLOR_GREEN, -1)  # >40 t/s - green
+                    curses.init_pair(self.COLOR_TPS_MED, curses.COLOR_YELLOW, -1)  # 20-40 t/s - yellow
+                    curses.init_pair(self.COLOR_TPS_LOW, curses.COLOR_RED, -1)  # <20 t/s - red
+                    curses.init_pair(18, curses.COLOR_GREEN, -1)
+                    curses.init_pair(19, curses.COLOR_CYAN, -1)
+                    curses.init_pair(20, curses.COLOR_MAGENTA, -1)
+                    curses.init_pair(21, curses.COLOR_YELLOW, -1)
+                    curses.init_pair(22, curses.COLOR_WHITE, -1)
+                    curses.init_pair(23, curses.COLOR_RED, -1)
                 except curses.error as e:
                     self.logger.debug(f"Color init error: {e}")
             else:
                 self._init_basic_colors()
-    
+
     def _init_basic_colors(self):
         """Initialize basic 8-color palette"""
         try:
@@ -2133,25 +2194,24 @@ class TTUInterface:
             curses.init_pair(self.COLOR_TPS_MED, curses.COLOR_YELLOW, -1)
             curses.init_pair(self.COLOR_TPS_LOW, curses.COLOR_RED, -1)
             # Phase 2: Dim/bright color variants
-            curses.init_pair(18, curses.COLOR_GREEN, -1)    # Dim green
-            curses.init_pair(19, curses.COLOR_CYAN, -1)     # Dim cyan
+            curses.init_pair(18, curses.COLOR_GREEN, -1)  # Dim green
+            curses.init_pair(19, curses.COLOR_CYAN, -1)  # Dim cyan
             curses.init_pair(20, curses.COLOR_MAGENTA, -1)  # Dim magenta
-            curses.init_pair(21, curses.COLOR_YELLOW, -1)    # Dim yellow
-            curses.init_pair(22, curses.COLOR_WHITE, -1)     # Bright white
-            curses.init_pair(23, curses.COLOR_RED, -1)       # Alert red
+            curses.init_pair(21, curses.COLOR_YELLOW, -1)  # Dim yellow
+            curses.init_pair(22, curses.COLOR_WHITE, -1)  # Bright white
+            curses.init_pair(23, curses.COLOR_RED, -1)  # Alert red
         except curses.error as e:
             self.logger.debug(f"Basic color init error: {e}")
 
-    def _draw_bar(self, value: float, max_value: float, width: int = 20,
-                  filled_color: int = 7, empty_color: int = 8):
+    def _draw_bar(self, value: float, max_value: float, width: int = 20, filled_color: int = 7, empty_color: int = 8):
         """Draw a progress bar using block characters"""
         if max_value <= 0:
-            return '░' * width
+            return "░" * width
 
         filled = int((value / max_value) * width)
         empty = width - filled
 
-        bar = '█' * filled + '░' * empty
+        bar = "█" * filled + "░" * empty
         return bar
 
     def _draw_shaded_bar_cell(self, row: int, bar_bottom: int, bar_top: int, base_color: int, x: int) -> None:
@@ -2187,19 +2247,26 @@ class TTUInterface:
         else:
             return self.COLOR_TPS_LOW  # Red (<10)
 
-    def _draw_sparkline(self, values: List[float], width: int = 20, height: int = 4,
-                        min_val: float = None, max_val: float = None,
-                        color: int = 2, fill: bool = False) -> List[str]:
+    def _draw_sparkline(
+        self,
+        values: List[float],
+        width: int = 20,
+        height: int = 4,
+        min_val: float = None,
+        max_val: float = None,
+        color: int = 2,
+        fill: bool = False,
+    ) -> List[str]:
         """Draw a sparkline chart using Unicode block characters.
         Uses lower block characters for fill effect, similar to btop.
         Returns list of strings representing the chart rows.
         """
         if not values or len(values) < 2:
-            return [' ' * width for _ in range(height)]
+            return [" " * width for _ in range(height)]
 
         data = list(values)[-width:]  # Take last 'width' values
         if len(data) < 2:
-            return [' ' * width for _ in range(height)]
+            return [" " * width for _ in range(height)]
 
         # Determine min/max for scaling
         if min_val is None:
@@ -2212,7 +2279,7 @@ class TTUInterface:
             max_val = min_val + 1
 
         val_range = max_val - min_val
-        rows = [' ' * width for _ in range(height)]
+        rows = [" " * width for _ in range(height)]
 
         # Calculate y position for each data point
         # y=0 is top, y=height-1 is bottom
@@ -2233,38 +2300,45 @@ class TTUInterface:
                 for x in range(x1, x2 + 1):
                     for y in range(y2, height):
                         if 0 <= y < height and 0 <= x < width:
-                            rows[y] = rows[y][:x] + '█' + rows[y][x+1:]
+                            rows[y] = rows[y][:x] + "█" + rows[y][x + 1 :]
             else:
                 # Draw line with vertical segments
                 if x1 == x2:
                     for y in range(min(y1, y2), max(y1, y2) + 1):
                         if 0 <= y < height and 0 <= x1 < width:
-                            rows[y] = rows[y][:x1] + '│' + rows[y][x1+1:]
+                            rows[y] = rows[y][:x1] + "│" + rows[y][x1 + 1 :]
                 else:
                     # Horizontal segment at y1
                     for x in range(x1, x2 + 1):
                         if 0 <= y1 < height and 0 <= x < width:
-                            rows[y1] = rows[y1][:x] + '─' + rows[y1][x+1:]
+                            rows[y1] = rows[y1][:x] + "─" + rows[y1][x + 1 :]
 
         # Draw endpoints
         if points:
             # First point
             x, y = points[0]
             if 0 <= y < height and 0 <= x < width:
-                rows[y] = rows[y][:x] + '●' + rows[y][x+1:]
+                rows[y] = rows[y][:x] + "●" + rows[y][x + 1 :]
             # Last point (emphasized)
             x, y = points[-1]
             if 0 <= y < height and 0 <= x < width:
-                rows[y] = rows[y][:x] + '●' + rows[y][x+1:]
+                rows[y] = rows[y][:x] + "●" + rows[y][x + 1 :]
 
         return rows
 
-    def _draw_gradient_bar(self, value: float, max_value: float, width: int = 20,
-                          low_color: int = 2, med_color: int = 13, high_color: int = 14) -> str:
+    def _draw_gradient_bar(
+        self,
+        value: float,
+        max_value: float,
+        width: int = 20,
+        low_color: int = 2,
+        med_color: int = 13,
+        high_color: int = 14,
+    ) -> str:
         """Draw a bar with color gradient based on value percentage.
         Returns tuple of (bar_string, color)."""
         if max_value <= 0:
-            return '░' * width, low_color
+            return "░" * width, low_color
 
         percent = value / max_value
         filled = int(percent * width)
@@ -2278,46 +2352,53 @@ class TTUInterface:
         else:
             color = high_color
 
-        bar = '█' * filled + '░' * empty
+        bar = "█" * filled + "░" * empty
         return bar, color
-    
+
     def _draw_tps_chart(self, tps_values: List[float], width: int = 40, height: int = 5):
         """Draw a simple TPS trend chart"""
         if not tps_values:
-            return ['No data'] * height
-        
+            return ["No data"] * height
+
         max_val = max(tps_values) if tps_values else 1
         if max_val <= 0:
             max_val = 1
-        
+
         chart = []
         for row in range(height):
             threshold = max_val * (height - row) / height
-            line = ''
+            line = ""
             for val in tps_values[-width:]:
                 if val >= threshold:
-                    line += '█'
+                    line += "█"
                 else:
-                    line += ' '
+                    line += " "
             chart.append(line)
-        
+
         return chart
 
-    def _draw_line_chart(self, values: List[float], width: int = 20, height: int = 4,
-                         min_val: float = 0, max_val: float = 100, color: int = 2) -> List[str]:
+    def _draw_line_chart(
+        self,
+        values: List[float],
+        width: int = 20,
+        height: int = 4,
+        min_val: float = 0,
+        max_val: float = 100,
+        color: int = 2,
+    ) -> List[str]:
         """Draw a line chart for usage percentage history with better visuals.
         Uses box-drawing characters and shows data points.
         Returns list of strings representing the chart rows.
         """
         if not values or len(values) < 2:
-            return [' ' * width] * height
+            return [" " * width] * height
 
         # Take the last 'width' number of values
         data = list(values)[-width:]
         if len(data) < 2:
-            return [' ' * width] * height
+            return [" " * width] * height
 
-        chart_rows = [' ' * width for _ in range(height)]
+        chart_rows = [" " * width for _ in range(height)]
 
         # Calculate points for each data value
         points = []
@@ -2337,13 +2418,13 @@ class TTUInterface:
                 for y in range(min(y1, y2), max(y1, y2) + 1):
                     row = height - 1 - y
                     if 0 <= row < height:
-                        chart_rows[row] = chart_rows[row][:x1] + '│' + chart_rows[row][x1+1:]
+                        chart_rows[row] = chart_rows[row][:x1] + "│" + chart_rows[row][x1 + 1 :]
             else:
                 # Horizontal segment
                 for x in range(min(x1, x2), max(x1, x2) + 1):
                     row = height - 1 - y1
                     if 0 <= row < height and 0 <= x < width:
-                        chart_rows[row] = chart_rows[row][:x] + '─' + chart_rows[row][x+1:]
+                        chart_rows[row] = chart_rows[row][:x] + "─" + chart_rows[row][x + 1 :]
 
         # Draw data points at key positions (first, last, and peaks)
         if points:
@@ -2351,24 +2432,31 @@ class TTUInterface:
             x, y = points[-1]
             row = height - 1 - y
             if 0 <= row < height and 0 <= x < width:
-                chart_rows[row] = chart_rows[row][:x] + '●' + chart_rows[row][x+1:]
+                chart_rows[row] = chart_rows[row][:x] + "●" + chart_rows[row][x + 1 :]
 
         return chart_rows
 
-    def _draw_area_chart(self, values: List[float], width: int = 25, height: int = 5,
-                        min_val: float = 0, max_val: float = 100, color: int = 2) -> List[str]:
+    def _draw_area_chart(
+        self,
+        values: List[float],
+        width: int = 25,
+        height: int = 5,
+        min_val: float = 0,
+        max_val: float = 100,
+        color: int = 2,
+    ) -> List[str]:
         """Draw an area chart with fill effect, similar to btop.
         Uses Unicode block characters for dense visualization.
         """
         if not values or len(values) < 2:
-            return [' ' * width] * height
+            return [" " * width] * height
 
         data = list(values)[-width:]
         if len(data) < 2:
-            return [' ' * width] * height
+            return [" " * width] * height
 
         val_range = max_val - min_val if max_val != min_val else 1
-        rows = [' ' * width for _ in range(height)]
+        rows = [" " * width for _ in range(height)]
 
         for i, val in enumerate(data):
             normalized = (val - min_val) / val_range
@@ -2376,7 +2464,7 @@ class TTUInterface:
 
             for row in range(height):
                 if height - 1 - row < filled_cells:
-                    rows[row] = rows[row][:i] + '█' + rows[row][i+1:]
+                    rows[row] = rows[row][:i] + "█" + rows[row][i + 1 :]
 
         return rows
 
@@ -2384,7 +2472,7 @@ class TTUInterface:
         """Draw the header"""
         title = f" {self.i18n.get('title')} "
         url_str = f"  URL: {self.server_url if self.server_url else 'N/A'} "
-        
+
         # Center title
         center_x = x + (width - len(title)) // 2
         try:
@@ -2393,34 +2481,34 @@ class TTUInterface:
             self.stdscr.addstr(y, x + width - len(url_str) - 1, url_str, curses.color_pair(self.COLOR_HEADER))
         except curses.error as e:
             self.logger.debug(f"Header draw error: {e}")
-    
+
     def _draw_cpu_info(self, y: int, x: int, width: int, height: int):
         """Draw CPU information panel with proper graph and axis labels"""
-        self._draw_panel_header(y, x, width, height, self.i18n.get('cpu_info'), self.COLOR_CPU)
+        self._draw_panel_header(y, x, width, height, self.i18n.get("cpu_info"), self.COLOR_CPU)
 
         if not self.cpu_info:
             try:
-                self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
+                self.stdscr.addstr(y + 2, x + 2, self.i18n.get("not_available"), curses.color_pair(self.COLOR_WARNING))
             except curses.error as e:
                 self.logger.debug(f"CPU panel not available draw error: {e}")
             return
 
         try:
             # Model name (header line)
-            model = self.cpu_info.get('model', 'Unknown')
+            model = self.cpu_info.get("model", "Unknown")
             # Truncate conservatively to fit the panel width
             available = width - 4
             if len(model) > available:
-                model = model[:available-3] + '...'
+                model = model[: available - 3] + "..."
             self.stdscr.addstr(y + 1, x + 2, model, curses.color_pair(self.COLOR_CPU) | curses.A_BOLD)
 
-            usage = self.cpu_info.get('usage', 0)
+            usage = self.cpu_info.get("usage", 0)
             usage_color = self.COLOR_CPU if usage < 70 else (self.COLOR_WARNING if usage < 90 else self.COLOR_ERROR)
 
             # Chart area layout
             chart_top = y + 2
             chart_height = max(3, height - 5)  # Leave room for Y-axis labels
-            chart_width = max(10, width - 10)   # Leave room for Y-axis
+            chart_width = max(10, width - 10)  # Leave room for Y-axis
 
             if chart_height > 3 and chart_width > 10:
                 # Draw Y-axis labels (percentages) on left side
@@ -2437,7 +2525,9 @@ class TTUInterface:
                 for h in [0, chart_height // 2, chart_height - 1]:
                     if h < chart_height:
                         self.stdscr.addstr(chart_top + h, chart_x, "┼", grid_color)
-                        self.stdscr.addstr(chart_top + h, chart_x + 1, "─" * min(chart_width - 2, width - chart_x - 2), grid_color)
+                        self.stdscr.addstr(
+                            chart_top + h, chart_x + 1, "─" * min(chart_width - 2, width - chart_x - 2), grid_color
+                        )
 
                 # Draw bar chart using gradient bars at each time point
                 data = list(self.cpu_usage_history)
@@ -2469,14 +2559,18 @@ class TTUInterface:
                     time_x = chart_x
                     if bar_area_width >= 20:
                         self.stdscr.addstr(time_y, time_x + 2, "30s", curses.color_pair(self.COLOR_CPU))
-                        self.stdscr.addstr(time_y, time_x + bar_area_width // 2, "15s", curses.color_pair(self.COLOR_CPU))
-                        self.stdscr.addstr(time_y, time_x + bar_area_width - 3, "now", curses.color_pair(self.COLOR_CPU))
+                        self.stdscr.addstr(
+                            time_y, time_x + bar_area_width // 2, "15s", curses.color_pair(self.COLOR_CPU)
+                        )
+                        self.stdscr.addstr(
+                            time_y, time_x + bar_area_width - 3, "now", curses.color_pair(self.COLOR_CPU)
+                        )
 
             # Bottom info row: Frequency and Cores
             info_y = y + height - 1
-            freq = self.cpu_info.get('frequency', 0) / 1000  # Convert to GHz
-            cores = self.cpu_info.get('cores', 0)
-            threads = self.cpu_info.get('threads', 0)
+            freq = self.cpu_info.get("frequency", 0) / 1000  # Convert to GHz
+            cores = self.cpu_info.get("cores", 0)
+            threads = self.cpu_info.get("threads", 0)
 
             freq_str = f"{freq:.2f} GHz" if freq > 0 else ""
             cores_str = f"Cores: {cores}/{threads}"
@@ -2491,23 +2585,27 @@ class TTUInterface:
 
     def _draw_memory_info(self, y: int, x: int, width: int, height: int):
         """Draw Memory information panel with bar chart"""
-        self._draw_panel_header(y, x, width, height, self.i18n.get('memory'), self.COLOR_CPU)
+        self._draw_panel_header(y, x, width, height, self.i18n.get("memory"), self.COLOR_CPU)
 
-        if not self.memory_info or self.memory_info.get('total', 0) <= 0:
+        if not self.memory_info or self.memory_info.get("total", 0) <= 0:
             try:
-                self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
+                self.stdscr.addstr(y + 2, x + 2, self.i18n.get("not_available"), curses.color_pair(self.COLOR_WARNING))
             except curses.error as e:
                 self.logger.debug(f"Memory panel not available draw error: {e}")
             return
 
         try:
-            mem_percent = self.memory_info.get('percent', 0)
-            mem_total = self.memory_info.get('total', 0)
-            mem_used = self.memory_info.get('used', 0)
-            mem_color = self.COLOR_CPU if mem_percent < 70 else (self.COLOR_WARNING if mem_percent < 90 else self.COLOR_ERROR)
+            mem_percent = self.memory_info.get("percent", 0)
+            mem_total = self.memory_info.get("total", 0)
+            mem_used = self.memory_info.get("used", 0)
+            mem_color = (
+                self.COLOR_CPU if mem_percent < 70 else (self.COLOR_WARNING if mem_percent < 90 else self.COLOR_ERROR)
+            )
 
             # Title/info row
-            self.stdscr.addstr(y + 1, x + 2, f"Used: {mem_used:.1f} / {mem_total:.1f} GB", curses.color_pair(self.COLOR_CPU))
+            self.stdscr.addstr(
+                y + 1, x + 2, f"Used: {mem_used:.1f} / {mem_total:.1f} GB", curses.color_pair(self.COLOR_CPU)
+            )
 
             # Chart area
             chart_top = y + 2
@@ -2528,7 +2626,9 @@ class TTUInterface:
                 for h in [0, chart_height // 2, chart_height - 1]:
                     if h < chart_height:
                         self.stdscr.addstr(chart_top + h, chart_x, "┼", grid_color)
-                        self.stdscr.addstr(chart_top + h, chart_x + 1, "─" * min(chart_width - 2, width - chart_x - 2), grid_color)
+                        self.stdscr.addstr(
+                            chart_top + h, chart_x + 1, "─" * min(chart_width - 2, width - chart_x - 2), grid_color
+                        )
 
                 # Draw bar chart
                 data = list(self.memory_usage_history)
@@ -2554,10 +2654,10 @@ class TTUInterface:
 
             # Bottom row: Memory type and freq
             info_y = y + height - 1
-            mem_type = self.memory_info.get('type', 'Unknown')
-            mem_freq = self.memory_info.get('frequency', 0)
+            mem_type = self.memory_info.get("type", "Unknown")
+            mem_freq = self.memory_info.get("frequency", 0)
 
-            type_str = f"{mem_type}" if mem_type and mem_type != 'Unknown' else ""
+            type_str = f"{mem_type}" if mem_type and mem_type != "Unknown" else ""
             if mem_freq > 0:
                 type_str += f" {mem_freq} MT/s" if type_str else f"{mem_freq} MT/s"
             if type_str:
@@ -2568,11 +2668,13 @@ class TTUInterface:
 
     def _draw_gpu_info(self, y: int, x: int, width: int, height: int):
         """Draw GPU information panel with bar charts and stats"""
-        self._draw_panel_header(y, x, width, height, self.i18n.get('gpu_info'), self.COLOR_GPU)
+        self._draw_panel_header(y, x, width, height, self.i18n.get("gpu_info"), self.COLOR_GPU)
 
         if not self.gpu_info:
             try:
-                self.stdscr.addstr(y + 2, x + 2, self.i18n.get('gpu_not_detected'), curses.color_pair(self.COLOR_WARNING))
+                self.stdscr.addstr(
+                    y + 2, x + 2, self.i18n.get("gpu_not_detected"), curses.color_pair(self.COLOR_WARNING)
+                )
             except curses.error as e:
                 self.logger.debug(f"GPU panel not detected draw error: {e}")
             return
@@ -2588,39 +2690,49 @@ class TTUInterface:
             if row >= y + height - 2:
                 break
 
-            name = gpu.get('name', 'Unknown')
+            name = gpu.get("name", "Unknown")
             # Truncate name to fit
             name_max_len = max(10, width - 25)
             if len(name) > name_max_len:
-                name = name[:name_max_len-3] + '...'
+                name = name[: name_max_len - 3] + "..."
             try:
                 # GPU name header
-                usage = gpu.get('utilization', 0)
+                usage = gpu.get("utilization", 0)
                 usage_color = self.COLOR_GPU if usage < 80 else (self.COLOR_WARNING if usage < 95 else self.COLOR_ERROR)
                 self.stdscr.addstr(row, x + 2, f"GPU {i}: {name}", curses.color_pair(self.COLOR_GPU) | curses.A_BOLD)
 
                 # GPU Usage bar chart
                 bar_width = min(20, width - 15)
                 bar_x = x + 2
-                bar, bar_color = self._draw_gradient_bar(usage, 100, bar_width,
-                                                        low_color=self.COLOR_GPU,
-                                                        med_color=self.COLOR_WARNING,
-                                                        high_color=self.COLOR_ERROR)
-                self.stdscr.addstr(row + 1, bar_x, f"Use:", curses.color_pair(self.COLOR_GPU))
+                bar, bar_color = self._draw_gradient_bar(
+                    usage,
+                    100,
+                    bar_width,
+                    low_color=self.COLOR_GPU,
+                    med_color=self.COLOR_WARNING,
+                    high_color=self.COLOR_ERROR,
+                )
+                self.stdscr.addstr(row + 1, bar_x, "Use:", curses.color_pair(self.COLOR_GPU))
                 self.stdscr.addstr(row + 1, bar_x + 5, bar, curses.color_pair(bar_color))
-                self.stdscr.addstr(row + 1, bar_x + bar_width + 7, f"{usage:3.0f}%", curses.color_pair(usage_color) | curses.A_BOLD)
+                self.stdscr.addstr(
+                    row + 1, bar_x + bar_width + 7, f"{usage:3.0f}%", curses.color_pair(usage_color) | curses.A_BOLD
+                )
 
                 # VRAM bar chart
-                mem_used = gpu.get('memory_used', 0) / 1024  # GB
-                mem_total = gpu.get('memory_total', 1) / 1024
+                mem_used = gpu.get("memory_used", 0) / 1024  # GB
+                mem_total = gpu.get("memory_total", 1) / 1024
                 mem_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
-                mem_freq = gpu.get('mem_clock', 0)  # Memory clock in GHz
+                mem_freq = gpu.get("mem_clock", 0)  # Memory clock in GHz
 
-                vram_bar, vram_color = self._draw_gradient_bar(mem_percent, 100, bar_width,
-                                                               low_color=self.COLOR_GPU,
-                                                               med_color=self.COLOR_WARNING,
-                                                               high_color=self.COLOR_ERROR)
-                self.stdscr.addstr(row + 2, bar_x, f"VRAM:", curses.color_pair(self.COLOR_GPU))
+                vram_bar, vram_color = self._draw_gradient_bar(
+                    mem_percent,
+                    100,
+                    bar_width,
+                    low_color=self.COLOR_GPU,
+                    med_color=self.COLOR_WARNING,
+                    high_color=self.COLOR_ERROR,
+                )
+                self.stdscr.addstr(row + 2, bar_x, "VRAM:", curses.color_pair(self.COLOR_GPU))
                 self.stdscr.addstr(row + 2, bar_x + 5, vram_bar, curses.color_pair(vram_color))
                 mem_str = f"{mem_used:5.1f}/{mem_total:.0f}GB"
                 if mem_freq > 0:
@@ -2628,11 +2740,11 @@ class TTUInterface:
                 self.stdscr.addstr(row + 2, bar_x + bar_width + 7, mem_str, curses.color_pair(self.COLOR_GPU))
 
                 # Stats row: temp, power, freq, fan
-                temp = gpu.get('temperature', 0)
+                temp = gpu.get("temperature", 0)
                 temp_color = self.COLOR_GPU if temp < 70 else (self.COLOR_WARNING if temp < 85 else self.COLOR_ERROR)
-                power = gpu.get('power', 0)
-                gpu_freq = gpu.get('gpu_clock', 0)  # GPU clock in GHz
-                fan_speed = gpu.get('fan_speed', 0)
+                power = gpu.get("power", 0)
+                gpu_freq = gpu.get("gpu_clock", 0)  # GPU clock in GHz
+                fan_speed = gpu.get("fan_speed", 0)
 
                 stats_y = row + 4
                 stats = []
@@ -2648,75 +2760,90 @@ class TTUInterface:
                 if stats and stats_y < y + height - 1:
                     self.stdscr.addstr(stats_y, x + 2, " | ".join(stats), curses.color_pair(temp_color))
 
-
             except curses.error as e:
                 self.logger.debug(f"GPU stats draw error: {e}")
 
     def _draw_model_status(self, y: int, x: int, width: int, height: int):
         """Draw model status panel - compact btop style"""
-        self._draw_panel_header(y, x, width, height, self.i18n.get('model_status'), self.COLOR_MODEL)
+        self._draw_panel_header(y, x, width, height, self.i18n.get("model_status"), self.COLOR_MODEL)
 
         if not self.model_info or len(self.model_info) == 0:
             try:
-                self.stdscr.addstr(y + 2, x + 2, self.i18n.get('not_available'), curses.color_pair(self.COLOR_WARNING))
+                self.stdscr.addstr(y + 2, x + 2, self.i18n.get("not_available"), curses.color_pair(self.COLOR_WARNING))
             except curses.error as e:
                 self.logger.debug(f"Model panel not available draw error: {e}")
             return
 
         try:
             # Model name - bold and prominent
-            name = self.model_info.get('name', 'Unknown')
-            name_short = name[:width - 8] if len(name) > width - 8 else name
+            name = self.model_info.get("name", "Unknown")
+            name_short = name[: width - 8] if len(name) > width - 8 else name
             self.stdscr.addstr(y + 2, x + 2, name_short, curses.color_pair(self.COLOR_MODEL) | curses.A_BOLD)
 
             # Determine state and stage from running tasks
-            running_tasks = [t for t in self.tasks if t.get('status') == 'running']
+            running_tasks = [t for t in self.tasks if t.get("status") == "running"]
             stage_row = y + 3
 
             if running_tasks:
                 # Show stage of first running task (with icon)
                 first_task = running_tasks[0]
-                stage = first_task.get('stage', 'unknown')
-                stage_translated = self.i18n.get(stage) if stage in ['prefill', 'decode', 'waiting'] else stage
-                stage_color = self.COLOR_PREFILL if stage == 'prefill' else (self.COLOR_DECODE if stage == 'decode' else self.COLOR_QUEUED)
-                icon = self.STAGE_ICONS.get(stage, '○')
-                self.stdscr.addstr(stage_row, x + 2, f"{icon} {stage_translated.upper()}", curses.color_pair(stage_color) | curses.A_BOLD)
+                stage = first_task.get("stage", "unknown")
+                stage_translated = self.i18n.get(stage) if stage in ["prefill", "decode", "waiting"] else stage
+                stage_color = (
+                    self.COLOR_PREFILL
+                    if stage == "prefill"
+                    else (self.COLOR_DECODE if stage == "decode" else self.COLOR_QUEUED)
+                )
+                icon = self.STAGE_ICONS.get(stage, "○")
+                self.stdscr.addstr(
+                    stage_row,
+                    x + 2,
+                    f"{icon} {stage_translated.upper()}",
+                    curses.color_pair(stage_color) | curses.A_BOLD,
+                )
             else:
-                state = self.model_info.get('state', 'Unknown')
-                stage_color = self.COLOR_SUCCESS if state == 'Running' else self.COLOR_WARNING
-                self.stdscr.addstr(stage_row, x + 2, f"● {state.upper()}", curses.color_pair(stage_color) | curses.A_BOLD)
+                state = self.model_info.get("state", "Unknown")
+                stage_color = self.COLOR_SUCCESS if state == "Running" else self.COLOR_WARNING
+                self.stdscr.addstr(
+                    stage_row, x + 2, f"● {state.upper()}", curses.color_pair(stage_color) | curses.A_BOLD
+                )
 
             # Context - compact display
-            ctx = self.model_info.get('context', 0)
+            ctx = self.model_info.get("context", 0)
             if ctx > 0:
                 ctx_str = f"Ctx: {ctx:,}" if ctx >= 1000 else f"Ctx: {ctx}"
                 self.stdscr.addstr(stage_row, x + 15, ctx_str, curses.color_pair(self.COLOR_MODEL))
 
             # Batch
-            batch = self.model_info.get('batch', 0)
+            batch = self.model_info.get("batch", 0)
             if batch > 0:
                 self.stdscr.addstr(y + 4, x + 2, f"Batch: {batch}", curses.color_pair(self.COLOR_MODEL))
 
             # Slots info - use actual task count if available
-            running = len([t for t in self.tasks if t.get('status') == 'running'])
+            running = len([t for t in self.tasks if t.get("status") == "running"])
             if running == 0 and self.stats:
-                running = self.stats.get('running_requests', 0)
+                running = self.stats.get("running_requests", 0)
             if running > 0:
                 self.stdscr.addstr(y + 4, x + 15, f"Active: {running}", curses.color_pair(self.COLOR_SUCCESS))
 
             # Total tokens processed - show input and output separately
             if self.stats:
-                eval_count = self.stats.get('eval_count', 0)
-                prompt_count = self.stats.get('prompt_eval_count', 0)
+                eval_count = self.stats.get("eval_count", 0)
+                prompt_count = self.stats.get("prompt_eval_count", 0)
                 if eval_count > 0 or prompt_count > 0:
-                    self.stdscr.addstr(y + height - 2, x + 2, f"In: {prompt_count:,} | Out: {eval_count:,}", curses.color_pair(self.COLOR_METRICS))
+                    self.stdscr.addstr(
+                        y + height - 2,
+                        x + 2,
+                        f"In: {prompt_count:,} | Out: {eval_count:,}",
+                        curses.color_pair(self.COLOR_METRICS),
+                    )
 
         except curses.error as e:
             self.logger.debug(f"Model status draw error: {e}")
 
     def _draw_realtime_metrics(self, y: int, x: int, width: int, height: int):
         """Draw real-time metrics panel with bar chart and info at top"""
-        self._draw_panel_header(y, x, width, height, self.i18n.get('realtime_metrics'), self.COLOR_METRICS)
+        self._draw_panel_header(y, x, width, height, self.i18n.get("realtime_metrics"), self.COLOR_METRICS)
 
         if not self.stats or len(self.stats) == 0:
             try:
@@ -2724,33 +2851,30 @@ class TTUInterface:
                     msg = f"API Error ({self.api_consecutive_failures})"
                     self.stdscr.addstr(y + 2, x + 2, msg, curses.color_pair(self.COLOR_ERROR))
                 else:
-                    msg = self.i18n.get('metrics_disabled')
+                    msg = self.i18n.get("metrics_disabled")
                     self.stdscr.addstr(y + 2, x + 2, msg, curses.color_pair(self.COLOR_WARNING))
             except curses.error as e:
                 self.logger.debug(f"Metrics panel not available draw error: {e}")
             return
 
         try:
-            tps = self.stats.get('tokens_per_second', 0)
-            prompt_rate = self.stats.get('prompt_eval_per_second', 0)
-            cache_hit = self.stats.get('cache_hit_rate', 0)
-            running = self.stats.get('running_requests', 0)
-            eval_count = self.stats.get('eval_count', 0)
-            prompt_count = self.stats.get('prompt_eval_count', 0)
+            tps = self.stats.get("tokens_per_second", 0)
+            prompt_rate = self.stats.get("prompt_eval_per_second", 0)
+            cache_hit = self.stats.get("cache_hit_rate", 0)
+            running = self.stats.get("running_requests", 0)
 
             # Info row at top (y+1)
             info_y = y + 1
             tps_color = self.COLOR_TPS_HIGH if tps > 40 else (self.COLOR_TPS_MED if tps > 20 else self.COLOR_TPS_LOW)
-            cache_color = self.COLOR_SUCCESS if cache_hit > 80 else (self.COLOR_WARNING if cache_hit > 50 else self.COLOR_ERROR)
 
             info_parts = [
                 f"TPS: {tps:.1f}",
                 f"P: {prompt_rate:.1f}/s" if prompt_rate > 0 else "P: --",
                 f"C: {cache_hit:.0f}%" if cache_hit > 0 else "C: --",
-                f"R: {running}"
+                f"R: {running}",
             ]
             info_str = " | ".join(info_parts)
-            self.stdscr.addstr(info_y, x + 2, info_str[:width - 4], curses.color_pair(self.COLOR_METRICS))
+            self.stdscr.addstr(info_y, x + 2, info_str[: width - 4], curses.color_pair(self.COLOR_METRICS))
 
             # Chart area (below info)
             chart_top = y + 2
@@ -2766,7 +2890,7 @@ class TTUInterface:
                 # Y-axis labels on left side
                 self.stdscr.addstr(chart_top, y_label_x, f"{tps_max:5.0f}", curses.color_pair(self.COLOR_METRICS))
                 mid_y = chart_top + chart_height // 2
-                self.stdscr.addstr(mid_y, y_label_x, f"{tps_max/2:5.0f}", curses.color_pair(self.COLOR_METRICS))
+                self.stdscr.addstr(mid_y, y_label_x, f"{tps_max / 2:5.0f}", curses.color_pair(self.COLOR_METRICS))
                 bottom_y = chart_top + chart_height - 1
                 self.stdscr.addstr(bottom_y, y_label_x, "    0", curses.color_pair(self.COLOR_METRICS))
 
@@ -2805,7 +2929,9 @@ class TTUInterface:
 
                 # Current value at right side
                 val_str = f"{tps:5.1f}"
-                self.stdscr.addstr(mid_y, chart_right - len(val_str) - 1, val_str, curses.color_pair(tps_color) | curses.A_BOLD)
+                self.stdscr.addstr(
+                    mid_y, chart_right - len(val_str) - 1, val_str, curses.color_pair(tps_color) | curses.A_BOLD
+                )
 
                 # X-axis time labels at bottom
                 time_y = chart_top + chart_height
@@ -2814,7 +2940,9 @@ class TTUInterface:
                     mid_pos = bar_area_width // 2
                     if mid_pos > 5:
                         self.stdscr.addstr(time_y, bar_area_x + mid_pos, "15s", curses.color_pair(self.COLOR_METRICS))
-                    self.stdscr.addstr(time_y, bar_area_x + bar_area_width - 3, "now", curses.color_pair(self.COLOR_METRICS))
+                    self.stdscr.addstr(
+                        time_y, bar_area_x + bar_area_width - 3, "now", curses.color_pair(self.COLOR_METRICS)
+                    )
 
         except curses.error as e:
             self.logger.debug(f"Metrics time label draw error: {e}")
@@ -2823,7 +2951,7 @@ class TTUInterface:
         """Draw a panel with header"""
         try:
             # Top border
-            self.stdscr.addstr(y, x, '┌' + '─' * (width - 2) + '┐', curses.color_pair(color))
+            self.stdscr.addstr(y, x, "┌" + "─" * (width - 2) + "┐", curses.color_pair(color))
             # Title with underline
             title_x = x + 2
             self.stdscr.addstr(y, title_x, f" {title} ", curses.color_pair(color) | curses.A_BOLD | curses.A_UNDERLINE)
@@ -2837,13 +2965,13 @@ class TTUInterface:
 
         if not self.tasks:
             try:
-                self.stdscr.addstr(y + 2, x + 2, self.i18n.get('no_tasks'), curses.color_pair(self.COLOR_QUEUED))
+                self.stdscr.addstr(y + 2, x + 2, self.i18n.get("no_tasks"), curses.color_pair(self.COLOR_QUEUED))
             except curses.error as e:
                 self.logger.debug(f"Tasks no_tasks draw error: {e}")
             return
 
         # Determine header based on available data
-        has_task_id = any(t.get('task_id', 0) for t in self.tasks)
+        has_task_id = any(t.get("task_id", 0) for t in self.tasks)
 
         try:
             if has_task_id:
@@ -2858,9 +2986,10 @@ class TTUInterface:
 
         # Group tasks by task_id (job_id)
         from collections import defaultdict
+
         jobs = defaultdict(list)
         for task in self.tasks:
-            task_id = task.get('task_id', 0)
+            task_id = task.get("task_id", 0)
             if task_id > 0:
                 jobs[task_id].append(task)
 
@@ -2878,14 +3007,16 @@ class TTUInterface:
                     break
 
                 slots = jobs[job_id]
-                is_last_job = (idx == job_count - 1)
+                is_last_job = idx == job_count - 1
 
                 # Draw job_id header
-                tree_char = '└── ' if is_last_job else '├── '
+                tree_char = "└── " if is_last_job else "├── "
                 job_line = f"JobID {job_id}"
                 full_line = f"{tree_char}{job_line:<21}"
                 try:
-                    self.stdscr.addstr(row, x + 2, full_line[:width - 4], curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+                    self.stdscr.addstr(
+                        row, x + 2, full_line[: width - 4], curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD
+                    )
                 except curses.error as e:
                     self.logger.debug(f"Tasks job line draw error: {e}")
                 row += 1
@@ -2897,68 +3028,72 @@ class TTUInterface:
                         break
 
                     is_last_slot = (s_idx == slot_count - 1) or is_last_job
-                    slot_prefix = '    ' if is_last_job else '│   '
-                    slot_char = '└── ' if is_last_slot else '├── '
+                    slot_prefix = "    " if is_last_job else "│   "
+                    slot_char = "└── " if is_last_slot else "├── "
 
-                    slot_id = task.get('id', 0)
-                    stage = task.get('stage', 'unknown')
-                    tps = task.get('tps', 0)
-                    tokens_gen = task.get('tokens_generated', 0)
-                    progress = task.get('progress', 0)
+                    slot_id = task.get("id", 0)
+                    stage = task.get("stage", "unknown")
+                    tps = task.get("tps", 0)
+                    tokens_gen = task.get("tokens_generated", 0)
+                    progress = task.get("progress", 0)
 
                     stage_color = {
-                        'prefill': self.COLOR_PREFILL,
-                        'decode': self.COLOR_DECODE,
-                        'waiting': self.COLOR_QUEUED
+                        "prefill": self.COLOR_PREFILL,
+                        "decode": self.COLOR_DECODE,
+                        "waiting": self.COLOR_QUEUED,
                     }.get(stage, self.COLOR_QUEUED)
 
-                    stage_str = self.i18n.get(stage)[:6] if stage in ['prefill', 'decode', 'waiting'] else stage[:6]
+                    stage_str = self.i18n.get(stage)[:6] if stage in ["prefill", "decode", "waiting"] else stage[:6]
                     tps_str = f"{tps:>6.1f}" if tps > 0 else "   --"
 
-                    slot_line = f"{slot_prefix}{slot_char}Slot {slot_id:<2} | {stage_str:<8} | {tokens_gen:<6} | {tps_str} | {progress:>3}%"
+                    slot_line = (
+                        f"{slot_prefix}{slot_char}Slot {slot_id:<2} | "
+                        f"{stage_str:<8} | {tokens_gen:<6} | {tps_str} | {progress:>3}%"
+                    )
                     try:
-                        self.stdscr.addstr(row, x + 2, slot_line[:width - 4], curses.color_pair(stage_color))
+                        self.stdscr.addstr(row, x + 2, slot_line[: width - 4], curses.color_pair(stage_color))
                     except curses.error as e:
                         self.logger.debug(f"Tasks slot line draw error: {e}")
                     row += 1
         else:
             # Synthetic data fallback (no tree structure)
-            for i, task in enumerate(self.tasks[:height - 5]):
+            for i, task in enumerate(self.tasks[: height - 5]):
                 if row >= max_row:
                     break
 
-                status = task.get('status', 'unknown')
-                stage = task.get('stage', 'unknown')
-                tps = task.get('tps', 0)
-                tokens_gen = task.get('tokens_generated', 0)
-                prompt_tokens = task.get('prompt_tokens', 0)
+                status = task.get("status", "unknown")
+                stage = task.get("stage", "unknown")
+                tps = task.get("tps", 0)
+                tokens_gen = task.get("tokens_generated", 0)
+                prompt_tokens = task.get("prompt_tokens", 0)
 
                 status_color = {
-                    'running': self.COLOR_SUCCESS,
-                    'queued': self.COLOR_QUEUED,
-                    'completed': self.COLOR_SUCCESS,
-                    'failed': self.COLOR_ERROR
+                    "running": self.COLOR_SUCCESS,
+                    "queued": self.COLOR_QUEUED,
+                    "completed": self.COLOR_SUCCESS,
+                    "failed": self.COLOR_ERROR,
                 }.get(status, self.COLOR_WARNING)
 
                 task_id = f"{task.get('id', i + 1):03d}"
 
-                if stage == 'prefill':
+                if stage == "prefill":
                     prog_str = f"{prompt_tokens:<8} | {'-':<8} | {task.get('prompt_tps', 0):>6.1f}"
-                elif stage == 'decode':
+                elif stage == "decode":
                     prog_str = f"{prompt_tokens:<8} | {tokens_gen:<8} | {tps:>6.1f}"
-                elif status == 'completed':
+                elif status == "completed":
                     prog_str = f"{prompt_tokens:<8} | {tokens_gen:<8} | {'-':>6}"
                 else:
                     prog_str = f"{'-':<8} | {'-':<8} | {'-':>6}"
 
-                stage_str = self.i18n.get(stage) if stage in ['prefill', 'decode', 'waiting'] else stage
-                status_str = self.i18n.get(status) if status in ['running', 'completed', 'queued', 'failed'] else status
+                stage_str = self.i18n.get(stage) if stage in ["prefill", "decode", "waiting"] else stage
+                status_str = self.i18n.get(status) if status in ["running", "completed", "queued", "failed"] else status
                 line = f"{task_id:<5} | {status_str:<8} | {prog_str}"
                 try:
-                    self.stdscr.addstr(row, x + 2, line[:width - 4], curses.color_pair(status_color))
+                    self.stdscr.addstr(row, x + 2, line[: width - 4], curses.color_pair(status_color))
                 except curses.error as e:
                     self.logger.debug(f"Tasks synthetic draw error: {e}")
                 row += 1
+
     def _draw_footer(self, y: int, x: int, width: int):
         """Draw footer with 3-zone layout: Navigation | Status | Time"""
         # Phase 2: 3-zone footer layout
@@ -2966,13 +3101,7 @@ class TTUInterface:
         # Zone 2 (Status): system status indicator
         # Zone 3 (Time): refresh rate and timestamp
 
-        shortcuts = [
-            "[+/-]Rate",
-            "[R]Refresh",
-            "[L]Log",
-            "[M]Lang",
-            "[Q]Quit"
-        ]
+        shortcuts = ["[+/-]Rate", "[R]Refresh", "[L]Log", "[M]Lang", "[Q]Quit"]
         nav_str = " ".join(shortcuts)
 
         # Zone 2: System status with icon
@@ -2988,14 +3117,14 @@ class TTUInterface:
 
         # Zone 3: Time info
         if self.last_update:
-            time_str = self.last_update.strftime('%H:%M:%S')
-            right_str = f"Rate: {self.refresh_interval*1000:.0f}ms | {time_str}"
+            time_str = self.last_update.strftime("%H:%M:%S")
+            right_str = f"Rate: {self.refresh_interval * 1000:.0f}ms | {time_str}"
         else:
-            right_str = f"Rate: {self.refresh_interval*1000:.0f}ms"
+            right_str = f"Rate: {self.refresh_interval * 1000:.0f}ms"
 
         # Draw footer border
         try:
-            self.stdscr.addstr(y, x, '─' * width, curses.color_pair(self.COLOR_HEADER))
+            self.stdscr.addstr(y, x, "─" * width, curses.color_pair(self.COLOR_HEADER))
 
             # Zone 1: Navigation (left side)
             self.stdscr.addstr(y + 1, x + 2, nav_str, curses.color_pair(self.COLOR_HEADER))
@@ -3011,7 +3140,7 @@ class TTUInterface:
         except curses.error as e:
             self.logger.debug(f"Footer draw error: {e}")
 
-    def refresh_system_data(self, cpu_collector: 'SystemCollector'):
+    def refresh_system_data(self, cpu_collector: "SystemCollector"):
         """Refresh system data (CPU, Memory, GPU) at fixed rate"""
         try:
             self.cpu_info = cpu_collector.get_cpu_info()
@@ -3019,8 +3148,8 @@ class TTUInterface:
             self.gpu_info = cpu_collector.get_gpu_info()
 
             # Update usage histories for line charts
-            self.cpu_usage_history.append(self.cpu_info.get('usage', 0))
-            self.memory_usage_history.append(self.memory_info.get('percent', 0))
+            self.cpu_usage_history.append(self.cpu_info.get("usage", 0))
+            self.memory_usage_history.append(self.memory_info.get("percent", 0))
 
             # Update per-GPU histories
             if self.gpu_info:
@@ -3035,9 +3164,9 @@ class TTUInterface:
 
                 # Update each GPU's history
                 for i, gpu in enumerate(self.gpu_info):
-                    self.gpu_usage_history[i].append(gpu.get('utilization', 0))
-                    gpu_mem_used = gpu.get('memory_used', 0)
-                    gpu_mem_total = gpu.get('memory_total', 1)
+                    self.gpu_usage_history[i].append(gpu.get("utilization", 0))
+                    gpu_mem_used = gpu.get("memory_used", 0)
+                    gpu_mem_total = gpu.get("memory_total", 1)
                     gpu_mem_percent = (gpu_mem_used / gpu_mem_total * 100) if gpu_mem_total > 0 else 0
                     self.gpu_mem_usage_history[i].append(gpu_mem_percent)
 
@@ -3047,24 +3176,61 @@ class TTUInterface:
             self.system_errors += 1
             self.logger.warning(f"System info error ({self.system_errors}): {e}")
 
-    def refresh_api_data(self, server_client: 'LLAMAServerClient'):
+    def refresh_api_data(self, server_client: "LLAMAServerClient"):
         """Refresh API data (model info, stats, tasks) at user-defined rate"""
-        # Periodically re-probe endpoints to discover new data
-        self.endpoint_refresh_counter += 1
-        if self.endpoint_refresh_counter >= self.endpoint_refresh_interval:
-            self.endpoint_refresh_counter = 0
-            try:
-                server_client.update_data()
-            except Exception as e:
-                self.logger.debug(f"Endpoint refresh error: {e}")
+        previous_prompt = self._prev_prompt_count
+        previous_eval = self._prev_eval_count
 
-        # Re-probe immediately on consecutive failures to recover from transient errors
-        if self.api_consecutive_failures >= 3:
+        # Endpoint discovery also runs in the worker. Reuse the /metrics body
+        # obtained by a probe so the cycle still performs only one scrape.
+        self.endpoint_refresh_counter += 1
+        probe_clock = time.monotonic()
+        should_probe = (
+            not self._has_probed_endpoints
+            or (
+                bool(server_client.available_endpoints)
+                and self.endpoint_refresh_counter >= self.endpoint_refresh_interval
+            )
+            or (self.api_consecutive_failures >= 3 and probe_clock >= self._next_endpoint_probe)
+        )
+
+        metrics_text = ""
+        cycle_slots: Optional[List[Dict[str, Any]]] = None
+        if should_probe:
+            self.endpoint_refresh_counter = 0
+            self._has_probed_endpoints = True
+            probe_started = time.monotonic()
             try:
                 server_client.update_data()
-                self.logger.info("Re-probing endpoints after consecutive failures")
+                cached_metrics = server_client.available_endpoints.get("/metrics", {})
+                if isinstance(cached_metrics, dict):
+                    metrics_text = str(cached_metrics.get("raw", ""))
+                cached_slots = server_client.available_endpoints.get("/slots")
+                if isinstance(cached_slots, list):
+                    cycle_slots = cached_slots
+                server_client.last_scrape_error = None if metrics_text else "metrics endpoint unavailable"
+                if metrics_text:
+                    self._endpoint_probe_backoff = 1.0
+                else:
+                    self._next_endpoint_probe = probe_clock + self._endpoint_probe_backoff
+                    self._endpoint_probe_backoff = min(60.0, self._endpoint_probe_backoff * 2)
             except Exception as e:
-                self.logger.debug(f"Endpoint re-probe error: {e}")
+                server_client.last_scrape_error = e.__class__.__name__
+                self.logger.debug(f"Endpoint refresh error: {e}")
+            finally:
+                server_client.last_scrape_duration = time.monotonic() - probe_started
+        else:
+            metrics_text = server_client.fetch_metrics_text() or ""
+            if metrics_text and not server_client.available_endpoints:
+                # The server recovered after an offline start. Discover its
+                # model/version endpoints on the next background cycle.
+                self._has_probed_endpoints = False
+
+        self.backend = server_client.backend
+        scrape_succeeded = bool(metrics_text)
+        self.last_attempt = datetime.now()
+        self.scrape_duration = server_client.last_scrape_duration
+        self.scrape_error = server_client.last_scrape_error
 
         # Get server data
         try:
@@ -3079,13 +3245,15 @@ class TTUInterface:
 
         try:
             stats, curr_prompt, curr_eval, curr_time = server_client.get_fresh_stats(
-                self._prev_prompt_count, self._prev_eval_count, self._prev_stats_time
+                previous_prompt, previous_eval, self._prev_stats_time, metrics_text=metrics_text
             )
             if stats:
                 self.stats = stats
-                tps = stats.get('tokens_per_second', 0)
+                tps = stats.get("tokens_per_second", 0)
                 self.tps_history.append(tps)
-                self.logger.debug(f"Updated stats: tokens_per_second={tps:.1f}, running_requests={stats.get('running_requests', 0)}")
+                self.logger.debug(
+                    f"Updated stats: tokens_per_second={tps:.1f}, running_requests={stats.get('running_requests', 0)}"
+                )
             else:
                 # No stats available, record 0 TPS
                 self.tps_history.append(0)
@@ -3102,30 +3270,33 @@ class TTUInterface:
 
         try:
             tasks, curr_prompt, curr_eval = server_client.get_fresh_tasks(
-                self._prev_prompt_count, self._prev_eval_count
+                previous_prompt,
+                previous_eval,
+                metrics_text=metrics_text,
+                slots_data=cycle_slots,
             )
             if tasks:
                 # Calculate per-slot TPS based on n_decoded delta
                 current_time = time.time()
                 for task in tasks:
-                    slot_id = task.get('id', 0)
-                    n_decoded = task.get('tokens_generated', 0)
+                    slot_id = task.get("id", 0)
+                    n_decoded = task.get("tokens_generated", 0)
                     if slot_id in self._slot_tps_tracker:
                         prev_n_decoded, prev_time = self._slot_tps_tracker[slot_id]
                         time_delta = current_time - prev_time
                         if time_delta > 0:
                             delta = n_decoded - prev_n_decoded
                             if delta >= 0:
-                                task['tps'] = delta / time_delta
+                                task["tps"] = delta / time_delta
                     self._slot_tps_tracker[slot_id] = (n_decoded, current_time)
 
                 self.tasks = tasks
                 self.logger.debug(f"Updated tasks: {len(tasks)} tasks")
 
                 # Sum all slot TPS for real-time TPS (replace stats TPS)
-                total_tps = sum(t.get('tps', 0) for t in tasks)
+                total_tps = sum(t.get("tps", 0) for t in tasks)
                 if total_tps > 0 and self.stats:
-                    self.stats['tokens_per_second'] = total_tps
+                    self.stats["tokens_per_second"] = total_tps
                     self.tps_history.append(total_tps)
                     self.logger.debug(f"Updated TPS from slots: {total_tps:.1f}")
         except Exception as e:
@@ -3133,60 +3304,59 @@ class TTUInterface:
             self.api_consecutive_failures += 1
             self.logger.warning(f"Tasks API error ({self.api_consecutive_failures}): {e}")
 
-        # If any API call succeeded, reset consecutive failure counter
-        if self.model_info or self.stats or self.tasks:
+        if scrape_succeeded:
             self.last_successful_api = datetime.now()
             self.api_consecutive_failures = 0
+            self.last_update = datetime.now()
+        else:
+            self.api_errors += 1
+            self.api_consecutive_failures += 1
 
-        # Phase 2: Trigger pulse animation on data refresh
-        self._pulse_active = True
-        threading.Timer(0.3, lambda: setattr(self, '_pulse_active', False)).start()
-
-        self.last_update = datetime.now()
-    
     def handle_input(self) -> bool:
         """Handle keyboard input. Returns False if should exit"""
         try:
             key = self.stdscr.getch()
             if key == -1:
                 return True
+            self._needs_redraw = True
 
-            if key in (ord('q'), ord('Q')):
+            if key in (ord("q"), ord("Q")):
                 return False
-            elif key in (ord('r'), ord('R')):
+            elif key in (ord("r"), ord("R")):
                 self.logger.debug("Manual refresh requested")
-            elif key in (ord('l'), ord('L')):
+                self._manual_refresh = True
+            elif key in (ord("l"), ord("L")):
                 log_path = self.log_manager.get_log_path()
                 self.logger.info(f"Log path: {log_path}")
-            elif key in (ord('m'), ord('M')):
+            elif key in (ord("m"), ord("M")):
                 new_lang = self.i18n.toggle()
                 self.logger.info(f"Language switched to: {new_lang}")
-            elif key in (ord('u'), ord('U')):
-                self.ui_style = 'btop' if self.ui_style == 'default' else 'default'
+            elif key in (ord("u"), ord("U")):
+                self.ui_style = "btop" if self.ui_style == "default" else "default"
                 self.logger.info(f"UI style switched to: {self.ui_style}")
                 self.stdscr.clear()  # Force full redraw after style switch
-            elif key == ord('+') or key == ord('='):
+            elif key == ord("+") or key == ord("="):
                 # Increase refresh rate (decrease interval by 100ms, min 500ms)
                 self.refresh_interval = max(0.5, self.refresh_interval - 0.1)
-                self.logger.info(f"Refresh rate increased: {self.refresh_interval*1000:.0f}ms")
-            elif key == ord('-') or key == ord('_'):
+                self.logger.info(f"Refresh rate increased: {self.refresh_interval * 1000:.0f}ms")
+            elif key == ord("-") or key == ord("_"):
                 # Decrease refresh rate (increase interval by 100ms, max 5s)
                 self.refresh_interval = min(5.0, self.refresh_interval + 0.1)
-                self.logger.info(f"Refresh rate decreased: {self.refresh_interval*1000:.0f}ms")
-            elif key == ord(' '):
+                self.logger.info(f"Refresh rate decreased: {self.refresh_interval * 1000:.0f}ms")
+            elif key == ord(" "):
                 self.detail_mode = not self.detail_mode
                 self.logger.debug(f"Detail mode: {self.detail_mode}")
-            elif key in (ord('h'), ord('H'), ord('?')):
+            elif key in (ord("h"), ord("H"), ord("?")):
                 self.logger.info("Q=Quit, M=Lang, U=UI, +=RateUp, -=RateDown, R=Refresh, L=Log")
         except curses.error as e:
             self.logger.debug(f"Input handling error: {e}")
 
         return True
-    
+
     def draw(self):
         """Draw the entire interface - btop-inspired layout"""
         try:
-            if self.ui_style == 'btop':
+            if self.ui_style == "btop":
                 self._draw_btop_ui()
                 return
 
@@ -3254,63 +3424,69 @@ class TTUInterface:
             self.stdscr.refresh()
         except curses.error as e:
             self.logger.debug(f"Curses draw error: {e}")
-    
-    def run(self, cpu_collector: 'SystemCollector',
-            server_client: 'LLAMAServerClient',
-            refresh_interval: float = 1.0):
-        """Main loop"""
+
+    def run(
+        self,
+        cpu_collector: Optional["SystemCollector"],
+        server_client: "LLAMAServerClient",
+        refresh_interval: float = 1.0,
+    ):
+        """Main loop with collection isolated from curses rendering."""
         self.server_url = server_client.base_url
         self.refresh_interval = refresh_interval  # Initialize with passed value
 
-        last_refresh = 0
-        last_draw = 0
-        min_draw_interval = 0.05  # Limit redraw rate to 20 FPS for smoother display
-
-        while self.running:
-            # Check for input
-            if not self.handle_input():
-                break
-
-            current_time = time.time()
-            data_changed = False
-
-            # Refresh all data at user-defined rate
-            if current_time - last_refresh >= self.refresh_interval:
-                # Refresh system data (CPU, Memory, GPU)
+        def collect() -> None:
+            if cpu_collector is not None:
                 try:
                     self.refresh_system_data(cpu_collector)
                 except Exception as e:
                     self.logger.warning(f"System refresh error: {e}")
+            try:
+                self.refresh_api_data(server_client)
+            except Exception as e:
+                self.logger.warning(f"API refresh error: {e}")
 
-                # Refresh API data (model, stats, tasks)
-                try:
-                    self.refresh_api_data(server_client)
-                except Exception as e:
-                    self.logger.warning(f"API refresh error: {e}")
+        future: Optional[Future] = None
+        next_refresh = 0.0
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="telemetry") as executor:
+            while self.running:
+                if not self.handle_input():
+                    break
 
-                data_changed = True
-                last_refresh = current_time
+                current_time = time.monotonic()
+                data_changed = False
+                if future is None and (current_time >= next_refresh or self._manual_refresh):
+                    self._manual_refresh = False
+                    future = executor.submit(collect)
+                    next_refresh = current_time + self.refresh_interval
 
-            # Draw interface only if data changed or enough time passed
-            if data_changed or (current_time - last_draw >= min_draw_interval):
-                try:
-                    self.draw()
-                    last_draw = current_time
-                except curses.error as e:
-                    self.logger.debug(f"Draw error: {e}")
+                if future is not None and future.done():
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self.logger.warning(f"Telemetry worker failed: {e}")
+                    future = None
+                    data_changed = True
 
-            # Small sleep to prevent CPU spinning and ensure consistent timing
-            time.sleep(0.01)
+                if data_changed or self._needs_redraw:
+                    try:
+                        self.draw()
+                        self._needs_redraw = False
+                    except curses.error as e:
+                        self.logger.debug(f"Draw error: {e}")
+
+                time.sleep(0.01)
 
 
 # ============================================================================
 # Main Program
 # ============================================================================
 
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='LLAMA.cpp Monitor - Real-time monitoring for llama-server',
+        description="llama-monitor - real-time monitoring for llama.cpp and vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -3318,155 +3494,193 @@ Examples:
   python llama_monitor.py -u http://localhost:8080  # Custom URL
   python llama_monitor.py -l en -r 1                # English, 1s refresh
   python llama_monitor.py -d /var/log/llama-monitor # Custom log dir
-        """
+        """,
     )
-    
+
     parser.add_argument(
-        '-u', '--url',
-        default='http://localhost:8000',
-        help='llama-server URL (default: http://localhost:8000)'
+        "-u",
+        "--url",
+        default="http://localhost:8000",
+        type=validate_server_url,
+        help="llama-server URL (default: http://localhost:8000)",
     )
-    
+
+    parser.add_argument("-r", "--rate", type=float, default=1.0, help="Refresh rate in seconds (default: 1.0)")
+
     parser.add_argument(
-        '-r', '--rate',
-        type=float,
-        default=1.0,
-        help='Refresh rate in seconds (default: 1.0)'
+        "--ui",
+        choices=["btop", "default"],
+        default=os.environ.get("LLAMA_MONITOR_UI", os.environ.get("UI_STYLE", "btop")).lower(),
+        help="Interface style: btop (default) or default",
     )
-    
+
     parser.add_argument(
-        '-l', '--language',
-        choices=['zh', 'en'],
-        default='zh',
-        help='Interface language: zh (Chinese) or en (English), default: zh'
+        "--backend",
+        choices=[kind.value for kind in BackendKind],
+        default=BackendKind.AUTO.value,
+        help="Inference backend override (default: auto)",
     )
-    
+
     parser.add_argument(
-        '-d', '--log-dir',
-        default=os.path.expanduser('~/llama-monitor/logs'),
-        help='Log directory (default: ~/llama-monitor/logs)'
+        "--system",
+        choices=[scope.value for scope in SystemScope],
+        default=SystemScope.AUTO.value,
+        help="Host metrics scope: auto, local, or off (default: auto)",
     )
-    
+
     parser.add_argument(
-        '-D', '--debug',
-        action='store_true',
-        help='Enable debug mode'
+        "--api-key-env",
+        default="VLLM_API_KEY",
+        help="Environment variable containing the API bearer token (default: VLLM_API_KEY)",
     )
-    
-    return parser.parse_args()
+
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument("--ca-cert", help="Custom CA bundle used to verify HTTPS servers")
+    tls_group.add_argument(
+        "--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)"
+    )
+
+    parser.add_argument(
+        "-l",
+        "--language",
+        choices=["zh", "en"],
+        default="zh",
+        help="Interface language: zh (Chinese) or en (English), default: zh",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--log-dir",
+        default=os.path.expanduser("~/llama-monitor/logs"),
+        help="Log directory (default: ~/llama-monitor/logs)",
+    )
+
+    parser.add_argument("-D", "--debug", action="store_true", help="Enable debug mode")
+
+    args = parser.parse_args()
+    if not 0.1 <= args.rate <= 60:
+        parser.error("--rate must be between 0.1 and 60 seconds")
+    if args.ca_cert and not os.path.isfile(args.ca_cert):
+        parser.error(f"--ca-cert does not exist or is not a file: {args.ca_cert}")
+    return args
 
 
-def probe_server_url(url: str, log_manager: LogManager) -> str:
+def probe_server_url(url: str, log_manager: LogManager, client_options: Optional[Dict[str, Any]] = None) -> str:
     """Probe and validate server URL"""
     logger = log_manager.logger
-    
-    client = LLAMAServerClient(url)
-    
+
+    client = LLAMAServerClient(url, **(client_options or {}))
+
     # Test connection
     if client.test_connection():
         logger.info(f"Connection successful to {url}")
         client.close()
         return url
-    
+
     logger.warning(f"Cannot connect to {url}, probing endpoints...")
-    
+
     # Try to probe
     endpoints = client.probe_endpoints()
     if endpoints:
         logger.info(f"Found available endpoints: {list(endpoints.keys())}")
         client.close()
         return url
-    
+
     client.close()
-    
-    # Ask user for input
-    print(f"\n⚠️  Cannot connect to {url}")
-    print("Please enter a valid llama-server URL (or press Enter to use default):")
-    new_url = input("URL > ").strip()
-    
-    if not new_url:
-        new_url = 'http://localhost:8000'
-    
-    # Validate new URL
-    test_client = LLAMAServerClient(new_url)
-    if test_client.test_connection():
-        logger.info(f"Connected to {new_url}")
-        test_client.close()
-        return new_url
-    
-    test_client.close()
-    logger.error(f"Failed to connect to {new_url}, using default")
-    return 'http://localhost:8000'
+
+    # A monitor should still open when the server is temporarily offline;
+    # refresh_api_data will recover as soon as the endpoint is available.
+    logger.warning(f"Server unavailable at startup: {url}; continuing in reconnect mode")
+    return url
 
 
 def main():
     """Main entry point"""
     # Parse arguments
     args = parse_args()
-    
+    os.environ["LLAMA_MONITOR_UI"] = args.ui
+
+    api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
+    verify: Any = False if args.insecure else (args.ca_cert or True)
+    client_options = {
+        "backend": args.backend,
+        "api_key": api_key,
+        "verify": verify,
+    }
+
     # Initialize logging
     log_manager = LogManager(args.log_dir)
     logger = log_manager.logger
-    
+
     if args.debug:
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug mode enabled")
-    
+
     logger.info("=" * 60)
     logger.info("LLAMA.cpp Monitor starting")
     logger.info(f"URL: {args.url}")
     logger.info(f"Language: {args.language}")
     logger.info(f"Refresh rate: {args.rate}s")
     logger.info(f"Log directory: {args.log_dir}")
-    
+    logger.info(f"Backend: {args.backend}; auth: {'enabled' if api_key else 'disabled'}")
+
     # Initialize i18n
     i18n = I18n(args.language)
-    
-    # Probe server URL
-    final_url = probe_server_url(args.url, log_manager)
-    
+
+    # Network discovery is deliberately deferred to the telemetry worker so
+    # an offline or slow server cannot block the terminal from opening.
+    final_url = args.url
+
+    cpu_collector: Optional[SystemCollector] = None
+    server_client: Optional[LLAMAServerClient] = None
+
     # Initialize components
     try:
-        # System collector
-        cpu_collector = SystemCollector()
-        logger.info(f"System collector initialized (GPU: {cpu_collector.gpu_available})")
-        
-        # Server client
-        server_client = LLAMAServerClient(final_url)
-        
-        # Initial probe
-        endpoints = server_client.probe_endpoints()
-        if endpoints:
-            logger.info(f"Available endpoints: {list(endpoints.keys())}")
+        system_enabled = args.system == SystemScope.LOCAL.value or (
+            args.system == SystemScope.AUTO.value and is_local_server(final_url)
+        )
+        if system_enabled:
+            cpu_collector = SystemCollector()
+            logger.info(f"Local system collector initialized (GPU: {cpu_collector.gpu_available})")
         else:
-            logger.warning("No endpoints available, will retry during monitoring")
-        
+            logger.info("Local system collector disabled for remote target")
+
+        # Server client
+        server_client = LLAMAServerClient(final_url, **client_options)
+
         # Run TUI
         def run_tui(stdscr):
-            ui = TTUInterface(stdscr, i18n, log_manager)
+            ui = TTUInterface(
+                stdscr,
+                i18n,
+                log_manager,
+                system_scope=SystemScope.LOCAL.value if system_enabled else SystemScope.OFF.value,
+            )
             try:
                 ui.run(cpu_collector, server_client, args.rate)
             except KeyboardInterrupt:
                 pass
             finally:
                 logger.info("TUI stopped")
-        
+
         curses.wrapper(run_tui)
-        
+
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         raise
     finally:
         # Cleanup
         try:
-            cpu_collector.cleanup()
-            server_client.close()
+            if cpu_collector is not None:
+                cpu_collector.cleanup()
+            if server_client is not None:
+                server_client.close()
         except Exception as e:
-            self.logger.debug(f"Cleanup error during shutdown: {e}")
-        
+            logger.debug(f"Cleanup error during shutdown: {e}")
+
         logger.info("LLAMA.cpp Monitor shutdown")
         logger.info("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

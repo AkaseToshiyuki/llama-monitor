@@ -1,4 +1,4 @@
-# LLAMA.cpp Monitor - Quick Reference
+# llama-monitor - Quick Reference
 
 ## 快速开始
 
@@ -27,6 +27,12 @@ python3 llama_monitor.py -D
 
 # 自定义日志目录
 python3 llama_monitor.py -d /var/log/llama-monitor
+
+# 远程 vLLM（自动关闭本机资源面板）
+VLLM_API_KEY='your-token' llama-monitor -u https://inference.example.com
+
+# 强制显示监控器本机资源
+llama-monitor -u https://inference.example.com --system local
 ```
 
 ## GPU 支持状态
@@ -83,7 +89,7 @@ python3 llama_monitor.py -d /var/log/llama-monitor
 | 10-20 t/s | 暗黄 | 偏弱 |
 | < 10 t/s | 红色 | 差 |
 
-## 3区 Footer 布局
+## Footer 布局
 
 ```
 [Navigation]           |  [Status]           |  [Time]
@@ -117,7 +123,7 @@ Q=退出 R=刷新 +=加速    |  ● All Systems OK   |  14:23:30
 
 ## 系统要求
 
-- Python 3.8+
+- Python 3.9+
 - Linux/macOS/Windows
 - 终端支持 curses（标准 Linux/macOS 终端）
 
@@ -128,7 +134,7 @@ Q=退出 R=刷新 +=加速    |  ● All Systems OK   |  14:23:30
 psutil>=5.9.0
 requests>=2.28.0
 
-# GPU 依赖
-nvidia-ml-py>=11.0  # NVIDIA GPU (稳定)
-# amdsmi              # AMD GPU (实验性, pip install)
+# GPU 可选依赖
+pip install '.[nvidia]'
+# pip install '.[amd]'
 ```
